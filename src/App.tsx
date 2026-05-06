@@ -155,7 +155,12 @@ declare global {
   }
 }
 
-const socket: Socket = io({ path: '/socket.io', autoConnect: false })
+const GITHUB_PAGES_HOSTNAME = 'savege-nonserviam.github.io'
+const GITHUB_PAGES_SERVER_URL = 'https://savege-nonserviamgithubio-production.up.railway.app'
+const SERVER_URL = resolveServerUrl(import.meta.env.VITE_SERVER_URL)
+const socket: Socket = SERVER_URL
+  ? io(SERVER_URL, { path: '/socket.io', autoConnect: false })
+  : io({ path: '/socket.io', autoConnect: false })
 const YOUTUBE_PLAYER_ID = 'youtube-player'
 const LOCAL_CLIENT_KEY = 'youwatch:client-id'
 const LOCAL_NAME_KEY = 'youwatch:name'
@@ -179,6 +184,30 @@ const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
 })
 
 let youtubeApiPromise: Promise<void> | null = null
+
+function resolveServerUrl(value: unknown) {
+  const configuredUrl = normalizeServerUrl(value)
+
+  if (configuredUrl) {
+    return configuredUrl
+  }
+
+  if (window.location.hostname === GITHUB_PAGES_HOSTNAME) {
+    return GITHUB_PAGES_SERVER_URL
+  }
+
+  return ''
+}
+
+function normalizeServerUrl(value: unknown) {
+  return String(value ?? '')
+    .trim()
+    .replace(/\/+$/, '')
+}
+
+function apiUrl(pathname: string) {
+  return SERVER_URL ? `${SERVER_URL}${pathname}` : pathname
+}
 
 function App() {
   const [clientId] = useState(getClientId)
@@ -939,7 +968,7 @@ function App() {
     setSearchError(null)
 
     try {
-      const response = await fetch(`/api/youtube/search?query=${encodeURIComponent(trimmedSearch)}`)
+      const response = await fetch(apiUrl(`/api/youtube/search?query=${encodeURIComponent(trimmedSearch)}`))
       const payload = (await response.json()) as SearchResponse
 
       if (!response.ok) {
@@ -1570,7 +1599,7 @@ async function fetchVideoMeta(videoId: string): Promise<VideoMeta> {
   let response: Response
 
   try {
-    response = await fetch(`/api/youtube/video?videoId=${encodeURIComponent(videoId)}`)
+    response = await fetch(apiUrl(`/api/youtube/video?videoId=${encodeURIComponent(videoId)}`))
   } catch {
     return fetchOembedVideoMeta(videoId)
   }
@@ -1589,7 +1618,7 @@ async function fetchVideoMeta(videoId: string): Promise<VideoMeta> {
 }
 
 async function fetchOembedVideoMeta(videoId: string): Promise<VideoMeta> {
-  const response = await fetch(`/api/youtube/oembed?videoId=${encodeURIComponent(videoId)}`)
+  const response = await fetch(apiUrl(`/api/youtube/oembed?videoId=${encodeURIComponent(videoId)}`))
   const payload = (await response.json()) as { video?: VideoMeta; message?: string }
 
   if (response.ok && payload.video) {
