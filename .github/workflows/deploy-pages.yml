@@ -32,6 +32,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check backend URL
+        run: test -n "$VITE_SERVER_URL"
+        env:
+          VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
+
       - name: Build frontend
         run: npm run build
         env:
