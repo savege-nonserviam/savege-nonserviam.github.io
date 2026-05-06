@@ -20,20 +20,40 @@ const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
 const MAX_OWNER_EVENT_FUTURE_MS = 1000
 const OWNER_EVENT_REORDER_GRACE_MS = 1200
 const MEMBER_COLORS = ['#ff5d5d', '#f7c948', '#58d7b4', '#78a6ff', '#d58cff', '#ff9b6a']
+const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
 
 const app = express()
 const httpServer = createServer(app)
-const corsOrigins = process.env.CORS_ORIGIN
+const configuredCorsOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map((origin) => origin.trim()).filter(Boolean)
-  : undefined
+  : []
+const corsOrigins = Array.from(new Set([...DEFAULT_CORS_ORIGINS, ...configuredCorsOrigins]))
 
 const io = new Server(httpServer, {
-  cors: corsOrigins ? { origin: corsOrigins, credentials: true } : undefined,
+  cors: { origin: corsOrigins, credentials: true },
 })
 
 const rooms = new Map()
 
 app.disable('x-powered-by')
+app.use((request, response, next) => {
+  const origin = request.headers.origin
+
+  if (corsOrigins?.length && origin && corsOrigins.includes(origin)) {
+    response.setHeader('Access-Control-Allow-Origin', origin)
+    response.setHeader('Access-Control-Allow-Credentials', 'true')
+    response.setHeader('Access-Control-Allow-Headers', 'Content-Type')
+    response.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+    response.setHeader('Vary', 'Origin')
+  }
+
+  if (request.method === 'OPTIONS') {
+    response.sendStatus(204)
+    return
+  }
+
+  next()
+})
 app.use(express.json({ limit: '1mb' }))
 
 app.get('/api/health', (_request, response) => {
