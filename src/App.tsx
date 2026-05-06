@@ -172,6 +172,8 @@ const CLOCK_SYNC_INTERVAL_MS = 2500
 const CLOCK_SAMPLE_LIMIT = 12
 const OWNER_TRANSIENT_PAUSE_GRACE_MS = 2400
 const OWNER_PLAY_COMMAND_GRACE_MS = 1500
+const MOBILE_DOUBLE_TAP_MS = 320
+const MOBILE_DOUBLE_TAP_DISTANCE_PX = 44
 const PREFERRED_PLAYBACK_QUALITY = 'hd1080'
 const PLAYBACK_QUALITY_FALLBACKS = ['highres', 'hd720', 'large', 'medium', 'small', 'tiny', 'default']
 const QUALITY_RETRY_DELAYS_MS = [0, 350, 900, 1800, 3600]
@@ -256,6 +258,7 @@ function App() {
   const ownerTransientSinceRef = useRef<number | null>(null)
   const lastOwnerCommandRef = useRef<{ status: PlaybackStatus; issuedAt: number } | null>(null)
   const lastAudibleVolumeRef = useRef(DEFAULT_VOLUME)
+  const videoTapRef = useRef<{ timerId: number; time: number; x: number; y: number } | null>(null)
   const videoShellRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
   const chatInputRef = useRef<HTMLInputElement | null>(null)
@@ -302,6 +305,12 @@ function App() {
   )
 
   const serverNow = useCallback(() => Date.now() + serverOffsetRef.current, [])
+
+  const openChatInput = useCallback(() => {
+    setChatOpen(true)
+    setFullscreenIdle(false)
+    chatInputRef.current?.focus({ preventScroll: true })
+  }, [])
 
   const clearQualityRetryTimers = useCallback(() => {
     qualityRetryTimersRef.current.forEach((timerId) => window.clearTimeout(timerId))
@@ -861,6 +870,14 @@ function App() {
   }, [chatOpen])
 
   useEffect(() => {
+    return () => {
+      if (videoTapRef.current) {
+        window.clearTimeout(videoTapRef.current.timerId)
+      }
+    }
+  }, [])
+
+  useEffect(() => {
     const nextVolume = clampVolume(volume)
 
     if (nextVolume > 0) {
@@ -935,7 +952,7 @@ function App() {
           const nextOpen = !wasOpen
 
           if (nextOpen) {
-            window.requestAnimationFrame(() => chatInputRef.current?.focus())
+            window.requestAnimationFrame(openChatInput)
           } else {
             chatInputRef.current?.blur()
           }
@@ -947,7 +964,7 @@ function App() {
 
     document.addEventListener('keydown', handleDocumentKeyDown)
     return () => document.removeEventListener('keydown', handleDocumentKeyDown)
-  }, [chatOpen])
+  }, [openChatInput])
 
   const handleSearchSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1034,12 +1051,52 @@ function App() {
     socket.emit('owner:play', { currentTime, serverTime: actionServerTime })
   }
 
-  const handleVideoSurfaceClick = () => {
+  const handleVideoSurfacePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!currentVideo) {
       return
     }
 
-    handleTogglePlayback()
+    if (event.target instanceof Element && event.target.closest('.player-overlay-content')) {
+      return
+    }
+
+    if (event.pointerType === 'mouse') {
+      handleTogglePlayback()
+      return
+    }
+
+    if (chatOpen) {
+      event.preventDefault()
+      openChatInput()
+      return
+    }
+
+    const now = Date.now()
+    const previousTap = videoTapRef.current
+    const distance = previousTap ? Math.hypot(event.clientX - previousTap.x, event.clientY - previousTap.y) : Number.POSITIVE_INFINITY
+    const isDoubleTap = previousTap && now - previousTap.time <= MOBILE_DOUBLE_TAP_MS && distance <= MOBILE_DOUBLE_TAP_DISTANCE_PX
+
+    if (isDoubleTap) {
+      window.clearTimeout(previousTap.timerId)
+      videoTapRef.current = null
+      event.preventDefault()
+      openChatInput()
+      return
+    }
+
+    videoTapRef.current = {
+      time: now,
+      x: event.clientX,
+      y: event.clientY,
+      timerId: window.setTimeout(() => {
+        videoTapRef.current = null
+        handleTogglePlayback()
+      }, MOBILE_DOUBLE_TAP_MS),
+    }
+  }
+
+  const handleMobileChatButton = () => {
+    openChatInput()
   }
 
   const handleSeek = (event: ChangeEvent<HTMLInputElement>) => {
@@ -1159,6 +1216,7 @@ function App() {
             onFocus={() => setSearchOpen(true)}
             placeholder="Search YouTube or paste a link"
             aria-label="Search YouTube or paste a link"
+            enterKeyHint="search"
             autoComplete="off"
           />
           <button className="icon-button search-submit" type="submit" title="Search" aria-label="Search" disabled={searching}>
@@ -1210,7 +1268,7 @@ function App() {
       <main className="watch-layout">
         <section className="stage-section" aria-label="Watch room">
           <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef}>
-            <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${isOwner ? 'is-owner' : ''}`} onClick={handleVideoSurfaceClick}>
+            <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${isOwner ? 'is-owner' : ''}`} onPointerUp={handleVideoSurfacePointerUp}>
               <div id={YOUTUBE_PLAYER_ID} className="youtube-player" />
               {!currentVideo && (
                 <div className="empty-player">
@@ -1317,6 +1375,15 @@ function App() {
               >
                 {isFullscreen ? <Minimize2 size={17} aria-hidden="true" /> : <Maximize2 size={17} aria-hidden="true" />}
               </button>
+              <button
+                className={`icon-button control-icon mobile-chat-toggle ${chatOpen ? 'is-active' : ''}`}
+                type="button"
+                onClick={handleMobileChatButton}
+                title="Chat"
+                aria-label="Open chat"
+              >
+                <MessageCircle size={17} aria-hidden="true" />
+              </button>
             </div>
 
             <div className="chat-feed" aria-live="polite">
@@ -1345,6 +1412,8 @@ function App() {
                 }}
                 placeholder="Message the room"
                 aria-label="Message the room"
+                enterKeyHint="send"
+                autoCapitalize="sentences"
                 maxLength={400}
               />
               <button className="icon-button send-button" type="submit" title="Send" aria-label="Send message">
