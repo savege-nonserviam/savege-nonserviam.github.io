@@ -200,9 +200,16 @@ function resolveServerUrl(value: unknown) {
 }
 
 function normalizeServerUrl(value: unknown) {
-  return String(value ?? '')
+  const serverUrl = String(value ?? '')
     .trim()
+    .replace(/^VITE_SERVER_URL=/, '')
     .replace(/\/+$/, '')
+
+  if (!serverUrl) {
+    return ''
+  }
+
+  return /^https?:\/\//i.test(serverUrl) ? serverUrl : `https://${serverUrl}`
 }
 
 function apiUrl(pathname: string) {
