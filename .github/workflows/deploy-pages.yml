@@ -33,7 +33,11 @@ jobs:
         run: npm ci
 
       - name: Check backend URL
-        run: test -n "$VITE_SERVER_URL"
+        run: |
+          if [ -z "$VITE_SERVER_URL" ]; then
+            echo "::error::Set repository variable VITE_SERVER_URL to https://savege-nonserviamgithubio-production.up.railway.app"
+            exit 1
+          fi
         env:
           VITE_SERVER_URL: ${{ vars.VITE_SERVER_URL }}
 
