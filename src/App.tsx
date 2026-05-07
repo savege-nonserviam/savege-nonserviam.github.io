@@ -172,6 +172,7 @@ const socket: Socket = SERVER_URL
 const YOUTUBE_PLAYER_ID = 'youtube-player'
 const LOCAL_CLIENT_KEY = 'youwatch:client-id'
 const LOCAL_NAME_KEY = 'youwatch:name'
+const LOCAL_NAME_CONFIRMED_KEY = 'youwatch:name-confirmed'
 const LOCAL_VOLUME_KEY = 'youwatch:volume'
 const DEFAULT_VOLUME = 72
 const SYNC_INTERVAL_MS = 500
@@ -339,7 +340,9 @@ function insertEmojiSuggestion(value: string, emoji: string) {
 
 function App() {
   const [clientId] = useState(getClientId)
-  const [displayName] = useState(getDisplayName)
+  const [displayName, setDisplayName] = useState(getStoredDisplayName)
+  const [nameDraft, setNameDraft] = useState(() => getStoredDisplayName())
+  const [nameDialogOpen, setNameDialogOpen] = useState(() => !getStoredDisplayName())
   const [roomId] = useState(resolveInitialRoomId)
   const [roomState, setRoomState] = useState<RoomState | null>(null)
   const [connected, setConnected] = useState(socket.connected)
@@ -361,6 +364,7 @@ function App() {
   const [duration, setDuration] = useState(0)
   const [chatOpen, setChatOpen] = useState(false)
   const [chatDraft, setChatDraft] = useState('')
+  const [miniPlayerOpen, setMiniPlayerOpen] = useState(false)
   const [analyzedMaterial, setAnalyzedMaterial] = useState<{ source: string; complexity: MaterialComplexity } | null>(null)
   const [materialMotion, setMaterialMotion] = useState(false)
   const [scrollState, setScrollState] = useState<ScrollState>('top')
@@ -368,6 +372,7 @@ function App() {
   const [fullscreenIdle, setFullscreenIdle] = useState(false)
 
   const roomStateRef = useRef<RoomState | null>(null)
+  const displayNameRef = useRef(displayName)
   const serverOffsetRef = useRef(0)
   const clockSamplesRef = useRef<ClockSample[]>([])
   const clockSyncedRef = useRef(false)
@@ -383,6 +388,8 @@ function App() {
   const chatInputRef = useRef<HTMLInputElement | null>(null)
 
   const currentVideo = roomState?.video ?? null
+  const canConnect = displayName.length > 0
+  const miniPlayerActive = miniPlayerOpen && Boolean(currentVideo)
   const materialComplexity: MaterialComplexity = currentVideo?.thumbnail
     ? analyzedMaterial?.source === currentVideo.thumbnail
       ? analyzedMaterial.complexity
@@ -398,7 +405,7 @@ function App() {
   const contentIsMoving = effectiveStatus === 'playing' || materialMotion
   const materialWeightTarget = materialComplexity === 'dense' ? 1 : materialComplexity === 'busy' ? 0.62 : 0.22
   const scrollDepthTarget = scrollState === 'compressed' ? 1 : scrollState === 'scrolled' ? 0.48 : 0
-  const focusDepthTarget = searchOpen || chatOpen || playerError ? 1 : 0
+  const focusDepthTarget = searchOpen || chatOpen || nameDialogOpen || playerError ? 1 : 0
   const chromeState = isFullscreen && fullscreenIdle && !chatOpen ? 'minimal' : searchOpen || chatOpen ? 'active' : scrollState === 'compressed' ? 'compact' : 'expanded'
   const materialDepth = useSpringValue(materialWeightTarget)
   const scrollDepth = useSpringValue(scrollDepthTarget)
@@ -427,6 +434,7 @@ function App() {
   const serverNow = useCallback(() => Date.now() + serverOffsetRef.current, [])
 
   const openChatInput = useCallback(() => {
+    setMiniPlayerOpen(false)
     setChatOpen(true)
     setFullscreenIdle(false)
     chatInputRef.current?.focus({ preventScroll: true })
@@ -472,9 +480,15 @@ function App() {
   )
 
   const joinRoom = useCallback(() => {
+    const name = displayNameRef.current
+
+    if (!name) {
+      return
+    }
+
     socket.emit(
       'room:join',
-      { roomId, clientId, name: displayName },
+      { roomId, clientId, name },
       (response: JoinResponse) => {
         if (response?.ok && response.state) {
           setRoomState(response.state)
@@ -484,7 +498,7 @@ function App() {
         setNotice(response?.message ?? 'Unable to join the room.')
       },
     )
-  }, [clientId, displayName, roomId])
+  }, [clientId, roomId])
 
   const syncClock = useCallback(() => {
     socket.emit('clock:ping', { clientSentAt: Date.now() })
@@ -605,6 +619,15 @@ function App() {
   }, [roomState])
 
   useEffect(() => {
+    displayNameRef.current = displayName
+  }, [displayName])
+
+  useEffect(() => {
+    if (!canConnect) {
+      socket.disconnect()
+      return
+    }
+
     const handleConnect = () => {
       setConnected(true)
       joinRoom()
@@ -687,7 +710,7 @@ function App() {
       socket.off('clock:pong', handleClockPong)
       socket.disconnect()
     }
-  }, [joinRoom, syncClock])
+  }, [canConnect, joinRoom, syncClock])
 
   useEffect(() => {
     if (!connected) {
@@ -1181,7 +1204,7 @@ function App() {
       return
     }
 
-    if (event.target instanceof Element && event.target.closest('.player-overlay-content')) {
+    if (event.target instanceof Element && event.target.closest('.player-overlay-content, .mini-player-topbar')) {
       return
     }
 
@@ -1193,6 +1216,12 @@ function App() {
     if (chatOpen) {
       event.preventDefault()
       openChatInput()
+      return
+    }
+
+    if (miniPlayerOpen) {
+      event.preventDefault()
+      handleTogglePlayback()
       return
     }
 
@@ -1265,6 +1294,43 @@ function App() {
     }
   }
 
+  const handleNameSubmit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+
+    const nextName = normalizeDisplayName(nameDraft)
+
+    if (!nextName) {
+      setNotice('Choose a name first.')
+      return
+    }
+
+    const previousName = displayName
+
+    writeLocalStorage(LOCAL_NAME_KEY, nextName)
+    writeLocalStorage(LOCAL_NAME_CONFIRMED_KEY, '1')
+    setDisplayName(nextName)
+    setNameDraft(nextName)
+    setNameDialogOpen(false)
+
+    if (connected && roomStateRef.current && nextName !== previousName) {
+      socket.emit('member:updateName', { name: nextName }, (response: JoinResponse) => {
+        if (response?.ok && response.state) {
+          setRoomState(response.state)
+          return
+        }
+
+        if (response && !response.ok) {
+          setNotice(response.message ?? 'Name saved locally. Rejoin to sync it.')
+        }
+      })
+    }
+  }
+
+  const handleEditName = () => {
+    setNameDraft(displayName)
+    setNameDialogOpen(true)
+  }
+
   const handleToggleFullscreen = async () => {
     const shell = videoShellRef.current
 
@@ -1278,10 +1344,30 @@ function App() {
         return
       }
 
+      setMiniPlayerOpen(false)
       await shell.requestFullscreen()
     } catch {
       setNotice('Fullscreen is not available in this browser.')
     }
+  }
+
+  const handleToggleMiniPlayer = async () => {
+    if (!currentVideo) {
+      setNotice('Load a video first.')
+      return
+    }
+
+    if (document.fullscreenElement) {
+      try {
+        await document.exitFullscreen()
+      } catch {
+        setNotice('Exit fullscreen first.')
+        return
+      }
+    }
+
+    setChatOpen(false)
+    setMiniPlayerOpen((wasOpen) => !wasOpen)
   }
 
   const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
@@ -1333,6 +1419,7 @@ function App() {
       className="app-shell"
       data-chrome={chromeState}
       data-material={materialComplexity}
+      data-mini-player={miniPlayerActive ? 'open' : 'closed'}
       data-motion={contentIsMoving ? 'moving' : 'still'}
       data-scroll={scrollState}
       data-scroll-direction={scrollDirection}
@@ -1388,6 +1475,10 @@ function App() {
         </form>
 
         <div className="room-tools">
+          <button className="room-pill room-button name-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleEditName} title="Change username">
+            <Users size={15} aria-hidden="true" />
+            {displayName || 'Name'}
+          </button>
           <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title={isOwner ? 'Owner' : `Owner: ${roomState?.ownerName ?? 'joining'}`}>
             <Crown size={15} aria-hidden="true" />
             {isOwner ? 'Owner' : 'Guest'}
@@ -1405,7 +1496,7 @@ function App() {
 
       <main className="watch-layout">
         <section className="stage-section" aria-label="Watch room">
-          <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef}>
+          <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef}>
             <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${isOwner ? 'is-owner' : ''}`} onPointerUp={handleVideoSurfacePointerUp}>
               <div id={YOUTUBE_PLAYER_ID} className="youtube-player" />
               {!currentVideo && (
@@ -1446,6 +1537,14 @@ function App() {
                       </a>
                     )}
                   </div>
+                </div>
+              )}
+              {miniPlayerActive && currentVideo && (
+                <div className="mini-player-topbar" onPointerUp={(event) => event.stopPropagation()}>
+                  <span className="mini-player-title">{currentVideo.title}</span>
+                  <button className="icon-button mini-restore-button" type="button" onClick={handleToggleMiniPlayer} title="Return to player" aria-label="Return to full player">
+                    <Maximize2 size={15} aria-hidden="true" />
+                  </button>
                 </div>
               )}
             </div>
@@ -1507,6 +1606,16 @@ function App() {
               <button
                 className="icon-button control-icon"
                 type="button"
+                onClick={handleToggleMiniPlayer}
+                disabled={!currentVideo}
+                title={miniPlayerActive ? 'Return to player' : 'Mini player'}
+                aria-label={miniPlayerActive ? 'Return to full player' : 'Open mini player'}
+              >
+                {miniPlayerActive ? <Maximize2 size={17} aria-hidden="true" /> : <Minimize2 size={17} aria-hidden="true" />}
+              </button>
+              <button
+                className="icon-button control-icon"
+                type="button"
                 onClick={handleToggleFullscreen}
                 title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
                 aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
@@ -1525,15 +1634,20 @@ function App() {
             </div>
 
             <div className="chat-feed" aria-live="polite">
-              {recentMessages.map((message) => (
-                <article className={`chat-message ${message.clientId === clientId ? 'is-own' : ''}`} key={message.id}>
-                  <span className="chat-author" style={{ color: message.color }}>
-                    {message.name}
-                  </span>
-                  <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>
-                  <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
-                </article>
-              ))}
+              {recentMessages.map((message) => {
+                const messageIsOwn = message.clientId === clientId
+
+                return (
+                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'}`} key={message.id} style={{ '--chat-color': messageIsOwn ? '#59d6bd' : message.color } as CSSProperties}>
+                    <span className="chat-author">
+                      <span className="chat-author-dot" aria-hidden="true" />
+                      <span>{messageIsOwn ? 'You' : message.name}</span>
+                    </span>
+                    <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>
+                    <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
+                  </article>
+                )
+              })}
             </div>
 
             <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
@@ -1589,6 +1703,29 @@ function App() {
           </div>
         </section>
       </main>
+
+      {nameDialogOpen && (
+        <div className="name-gate" role="dialog" aria-modal="true" aria-labelledby="name-gate-title">
+          <form className="name-card" onSubmit={handleNameSubmit}>
+            <span className="name-card-icon">
+              <Users size={22} aria-hidden="true" />
+            </span>
+            <h2 id="name-gate-title">What should people call you?</h2>
+            <input
+              value={nameDraft}
+              onChange={(event) => setNameDraft(event.currentTarget.value)}
+              placeholder="Username"
+              aria-label="Username"
+              autoComplete="nickname"
+              maxLength={24}
+              autoFocus
+            />
+            <button className="name-submit" type="submit" disabled={!normalizeDisplayName(nameDraft)}>
+              Join room
+            </button>
+          </form>
+        </div>
+      )}
 
       {notice && <div className="notice">{notice}</div>}
     </div>
@@ -1931,16 +2068,18 @@ function getClientId() {
   return clientId
 }
 
-function getDisplayName() {
-  const storedName = readLocalStorage(LOCAL_NAME_KEY)
+function getStoredDisplayName() {
+  const storedName = normalizeDisplayName(readLocalStorage(LOCAL_NAME_KEY))
+  const confirmed = readLocalStorage(LOCAL_NAME_CONFIRMED_KEY) === '1'
 
-  if (storedName) {
-    return storedName
-  }
+  return confirmed ? storedName : ''
+}
 
-  const name = `Viewer ${Math.floor(100 + Math.random() * 900)}`
-  writeLocalStorage(LOCAL_NAME_KEY, name)
-  return name
+function normalizeDisplayName(value: unknown) {
+  return String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 24)
 }
 
 function getStoredVolume() {

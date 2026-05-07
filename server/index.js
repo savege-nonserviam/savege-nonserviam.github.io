@@ -20,7 +20,7 @@ const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
 const MAX_OWNER_EVENT_FUTURE_MS = 1000
 const OWNER_EVENT_REORDER_GRACE_MS = 1200
 const MAX_CHAT_BODY_LENGTH = 400
-const MEMBER_COLORS = ['#ff5d5d', '#f7c948', '#58d7b4', '#78a6ff', '#d58cff', '#ff9b6a']
+const MEMBER_COLORS = ['#ff6b6b', '#ffd166', '#06d6a0', '#4dabf7', '#b197fc', '#ff922b', '#f06595', '#66d9e8', '#c0eb75', '#ffa8a8']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
 const EMOJI_SHORTCODES = new Map([
   ['smile', '🙂'],
@@ -368,6 +368,28 @@ io.on('connection', (socket) => {
     room.messages.push(message)
     room.messages = room.messages.slice(-MAX_MESSAGES)
     io.to(room.id).emit('chat:message', message)
+  })
+
+  socket.on('member:updateName', (payload, reply) => {
+    const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
+
+    if (!room || !member?.connected) {
+      reply?.({ ok: false, message: 'Join the room before changing your name.' })
+      return
+    }
+
+    const name = normalizeName(payload?.name)
+
+    member.name = name
+
+    if (room.ownerId === member.clientId) {
+      room.ownerName = name
+    }
+
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
   })
 
   socket.on('owner:loadVideo', (payload) => {
