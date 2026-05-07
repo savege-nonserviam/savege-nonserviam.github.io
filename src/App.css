@@ -1,8 +1,8 @@
 .app-shell {
-  --adaptive-blur: 38px;
-  --adaptive-fill: 0.012;
-  --adaptive-saturation: 0.9;
-  --adaptive-smoke: 0.17;
+  --adaptive-blur: 42px;
+  --adaptive-fill: 0.016;
+  --adaptive-saturation: 1.02;
+  --adaptive-smoke: 0.19;
   --chrome-depth: 1;
   --focus-depth: 0;
   --material-weight: 0.22;
@@ -14,8 +14,9 @@
   min-height: 100svh;
   color: var(--text-primary);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(5, 6, 9, 0) 320px),
-    linear-gradient(90deg, rgba(255, 79, 87, 0.05), transparent 34%, rgba(89, 214, 189, 0.038) 72%, transparent),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.064), rgba(5, 6, 9, 0) 340px),
+    linear-gradient(112deg, rgba(255, 79, 87, 0.052), transparent 34%, rgba(89, 214, 189, 0.046) 72%, transparent),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 52%),
     repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.014) 0 1px, transparent 1px 132px),
     var(--bg-page);
   animation: app-rise 460ms cubic-bezier(0.16, 1, 0.3, 1) both;
@@ -43,11 +44,12 @@
   padding: 10px 24px;
   border-bottom: 1px solid var(--line-subtle);
   background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.018)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.096), rgba(255, 255, 255, 0.02)),
+    linear-gradient(90deg, rgba(255, 79, 87, 0.035), transparent 42%, rgba(89, 214, 189, 0.028)),
     rgba(5, 6, 9, 0.72);
-  -webkit-backdrop-filter: blur(28px) saturate(1.35);
-  backdrop-filter: blur(28px) saturate(1.35);
-  box-shadow: 0 18px 58px rgba(0, 0, 0, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  -webkit-backdrop-filter: blur(32px) saturate(1.42) brightness(0.9);
+  backdrop-filter: blur(32px) saturate(1.42) brightness(0.9);
+  box-shadow: 0 20px 70px rgba(0, 0, 0, 0.32), inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 -1px 0 rgba(255, 255, 255, 0.035);
   transition: min-height 260ms cubic-bezier(0.2, 0.9, 0.18, 1), padding 260ms cubic-bezier(0.2, 0.9, 0.18, 1), background 220ms ease, box-shadow 220ms ease;
 }
 
@@ -135,8 +137,8 @@
   border-radius: 999px;
   color: rgba(239, 246, 255, 0.9);
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.07), transparent 44%, rgba(255, 255, 255, 0.018)),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.06), transparent 38%, rgba(255, 255, 255, 0.006)),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.092), transparent 44%, rgba(255, 255, 255, 0.022)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.072), transparent 38%, rgba(255, 255, 255, 0.008)),
     var(--glass-fill),
     var(--glass-smoke);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -1129,7 +1131,9 @@
   gap: 8px;
   width: min(440px, calc(100vw - 40px));
   pointer-events: none;
-  transition: opacity 210ms cubic-bezier(0.2, 0.9, 0.18, 1), transform 210ms cubic-bezier(0.2, 0.9, 0.18, 1), bottom 260ms cubic-bezier(0.2, 0.9, 0.18, 1);
+  opacity: 1;
+  filter: drop-shadow(0 18px 28px rgba(0, 0, 0, 0.42));
+  transition: transform 210ms cubic-bezier(0.2, 0.9, 0.18, 1), bottom 260ms cubic-bezier(0.2, 0.9, 0.18, 1);
 }
 
 .video-shell.is-fullscreen .chat-feed {
@@ -1142,15 +1146,6 @@
   bottom: 154px;
 }
 
-.video-shell.is-fullscreen.is-idle:not(.is-chat-open) .chat-feed {
-  opacity: 0.16;
-  transform: translateX(-8px) translateY(4px);
-}
-
-.video-shell.is-fullscreen.is-idle:not(.is-chat-open) .chat-message time {
-  opacity: 0;
-}
-
 .chat-message {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
@@ -1158,9 +1153,13 @@
   align-items: baseline;
   width: fit-content;
   max-width: 100%;
-  padding: 0;
+  padding: 3px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.075);
+  border-radius: 7px;
   color: #fff;
-  background: transparent;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.018)), rgba(0, 0, 0, 0.22);
+  -webkit-backdrop-filter: blur(12px) saturate(1.1);
+  backdrop-filter: blur(12px) saturate(1.1);
   font-size: 15px;
   font-weight: 760;
   line-height: 1.28;
@@ -1176,6 +1175,8 @@
 
 .chat-message.is-own {
   color: #d8fff4;
+  border-color: rgba(89, 214, 189, 0.16);
+  background: linear-gradient(180deg, rgba(89, 214, 189, 0.11), rgba(255, 255, 255, 0.018)), rgba(0, 0, 0, 0.24);
 }
 
 .chat-author {
@@ -1192,6 +1193,65 @@
   color: rgba(255, 255, 255, 0.76);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+.emoji-suggestions {
+  position: fixed;
+  left: 50%;
+  bottom: 84px;
+  z-index: 31;
+  display: flex;
+  gap: 6px;
+  width: min(620px, calc(100vw - 32px));
+  padding: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background:
+    linear-gradient(135deg, rgba(255, 255, 255, 0.096), rgba(255, 255, 255, 0.018) 48%, rgba(89, 214, 189, 0.042)),
+    rgba(7, 9, 15, 0.74);
+  -webkit-backdrop-filter: blur(34px) saturate(1.28) brightness(0.86);
+  backdrop-filter: blur(34px) saturate(1.28) brightness(0.86);
+  box-shadow: 0 24px 74px rgba(0, 0, 0, 0.42), inset 0 1px 0 rgba(255, 255, 255, 0.18), inset 0 -1px 0 rgba(255, 255, 255, 0.045);
+  transform: translateX(-50%);
+  animation: panel-in 150ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.video-shell.is-fullscreen .emoji-suggestions {
+  bottom: 160px;
+  z-index: 81;
+  width: min(560px, calc(100% - 42px));
+}
+
+.emoji-suggestion {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 1 1 0;
+  min-width: 0;
+  height: 34px;
+  gap: 6px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 999px;
+  color: rgba(239, 246, 255, 0.9);
+  background: rgba(255, 255, 255, 0.052);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 720;
+  transition: color 150ms ease, background 150ms ease, transform 150ms ease;
+}
+
+.emoji-suggestion:hover,
+.emoji-suggestion:focus-visible {
+  color: #fff;
+  background: rgba(89, 214, 189, 0.14);
+  transform: translateY(-1px);
+}
+
+.emoji-symbol {
+  flex: 0 0 auto;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .chat-composer {
@@ -1221,8 +1281,8 @@
   border-radius: 999px;
   color: rgba(239, 246, 255, 0.92);
   background:
-    linear-gradient(135deg, rgba(255, 255, 255, 0.084), transparent 42%, rgba(255, 255, 255, 0.018)),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.072), transparent 40%, rgba(0, 0, 0, 0.025)),
+    linear-gradient(135deg, rgba(255, 255, 255, 0.112), transparent 42%, rgba(89, 214, 189, 0.036)),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.082), transparent 40%, rgba(0, 0, 0, 0.025)),
     var(--glass-fill-strong),
     rgba(8, 11, 18, 0.13);
   -webkit-backdrop-filter: blur(48px) saturate(0.72) brightness(0.84) contrast(1.13);
@@ -1382,6 +1442,7 @@
   .titlebar,
   .search-shell,
   .search-panel,
+  .emoji-suggestions,
   .room-pill,
   .control-bar,
   .chat-composer,
@@ -1393,7 +1454,8 @@
   }
 
   .video-shell.is-fullscreen .control-bar,
-  .video-shell.is-fullscreen .chat-composer {
+  .video-shell.is-fullscreen .chat-composer,
+  .video-shell.is-fullscreen .emoji-suggestions {
     background: rgba(12, 15, 23, 0.9);
   }
 }
@@ -1569,6 +1631,25 @@
     gap: 6px;
   }
 
+  .emoji-suggestions,
+  .video-shell.is-fullscreen .emoji-suggestions {
+    bottom: calc(68px + env(safe-area-inset-bottom, 0px));
+    width: calc(100vw - 20px);
+    overflow-x: auto;
+    justify-content: flex-start;
+    border-radius: 8px;
+    scrollbar-width: none;
+  }
+
+  .emoji-suggestions::-webkit-scrollbar {
+    display: none;
+  }
+
+  .emoji-suggestion {
+    flex: 0 0 auto;
+    min-width: 84px;
+  }
+
   .video-shell.is-fullscreen .chat-feed,
   .video-shell.is-fullscreen.is-chat-open .chat-feed {
     left: 12px;
@@ -1703,6 +1784,15 @@
     bottom: calc(10px + env(safe-area-inset-bottom, 0px));
     width: min(560px, calc(100vw - 20px));
     height: 46px;
+  }
+
+  .emoji-suggestions,
+  .video-shell.is-fullscreen .emoji-suggestions {
+    bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+    width: min(560px, calc(100vw - 20px));
+    overflow-x: auto;
+    justify-content: flex-start;
+    border-radius: 8px;
   }
 
   .video-shell.is-fullscreen.is-chat-open .control-bar {

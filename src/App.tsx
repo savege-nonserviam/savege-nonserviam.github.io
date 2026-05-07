@@ -7,6 +7,7 @@ import {
   type CSSProperties,
   type ChangeEvent,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
 import {
@@ -99,6 +100,13 @@ type ClockSample = {
   receivedAt: number
 }
 
+type EmojiOption = {
+  name: string
+  emoji: string
+  aliases?: string[]
+  keywords?: string[]
+}
+
 type YouTubePlayer = {
   loadVideoById: (options: { videoId: string; startSeconds?: number }) => void
   cueVideoById: (options: { videoId: string; startSeconds?: number }) => void
@@ -184,6 +192,53 @@ const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   minute: '2-digit',
 })
+const EMOJI_OPTIONS: EmojiOption[] = [
+  { name: 'smile', emoji: '🙂', aliases: ['happy'], keywords: ['happy', 'nice'] },
+  { name: 'grin', emoji: '😀', aliases: ['grinning'], keywords: ['happy'] },
+  { name: 'joy', emoji: '😂', aliases: ['laugh', 'lol'], keywords: ['funny', 'laugh'] },
+  { name: 'rofl', emoji: '🤣', aliases: ['lmao'], keywords: ['funny', 'laugh'] },
+  { name: 'wink', emoji: '😉', keywords: ['joke'] },
+  { name: 'blush', emoji: '😊', aliases: ['cute'], keywords: ['happy'] },
+  { name: 'heart', emoji: '❤️', aliases: ['love'], keywords: ['like'] },
+  { name: 'fire', emoji: '🔥', aliases: ['lit'], keywords: ['hot'] },
+  { name: 'clap', emoji: '👏', aliases: ['applause'], keywords: ['nice'] },
+  { name: 'thumbsup', emoji: '👍', aliases: ['thumbs_up', '+1'], keywords: ['yes', 'like'] },
+  { name: 'thumbsdown', emoji: '👎', aliases: ['thumbs_down', '-1'], keywords: ['no'] },
+  { name: 'ok', emoji: '👌', aliases: ['ok_hand'], keywords: ['yes'] },
+  { name: 'pray', emoji: '🙏', aliases: ['please'], keywords: ['thanks'] },
+  { name: 'party', emoji: '🥳', aliases: ['partying'], keywords: ['celebrate'] },
+  { name: 'eyes', emoji: '👀', keywords: ['watch', 'look'] },
+  { name: 'sob', emoji: '😭', aliases: ['cry'], keywords: ['sad'] },
+  { name: 'angry', emoji: '😡', aliases: ['mad'], keywords: ['rage'] },
+  { name: 'skull', emoji: '💀', aliases: ['dead'], keywords: ['funny'] },
+  { name: 'cool', emoji: '😎', aliases: ['sunglasses'], keywords: ['nice'] },
+  { name: 'thinking', emoji: '🤔', aliases: ['think'], keywords: ['hmm'] },
+  { name: 'wave', emoji: '👋', aliases: ['hello'], keywords: ['hi'] },
+  { name: 'rocket', emoji: '🚀', keywords: ['fast', 'launch'] },
+  { name: 'star', emoji: '⭐', keywords: ['favorite'] },
+  { name: 'check', emoji: '✅', aliases: ['done'], keywords: ['yes'] },
+  { name: 'x', emoji: '❌', aliases: ['cross'], keywords: ['no'] },
+  { name: 'warning', emoji: '⚠️', aliases: ['warn'], keywords: ['careful'] },
+  { name: 'popcorn', emoji: '🍿', keywords: ['watch'] },
+  { name: '100', emoji: '💯', aliases: ['hundred'], keywords: ['perfect'] },
+  { name: 'sparkles', emoji: '✨', aliases: ['shine'], keywords: ['magic'] },
+  { name: 'coffee', emoji: '☕', keywords: ['drink'] },
+  { name: 'music', emoji: '🎵', aliases: ['note'], keywords: ['song'] },
+  { name: 'crown', emoji: '👑', keywords: ['owner'] },
+]
+const EMOJI_BY_SHORTCODE = new Map(
+  EMOJI_OPTIONS.reduce<Array<[string, string]>>((entries, option) => {
+    entries.push([option.name, option.emoji])
+
+    for (const alias of option.aliases ?? []) {
+      entries.push([alias, option.emoji])
+    }
+
+    return entries
+  }, []),
+)
+const EMOJI_SHORTCODE_PATTERN = /:([a-z0-9_+-]{1,32}):/gi
+const ACTIVE_EMOJI_TOKEN_PATTERN = /(?:^|\s):([a-z0-9_+-]{0,24})$/i
 
 let youtubeApiPromise: Promise<void> | null = null
 
@@ -216,6 +271,29 @@ function normalizeServerUrl(value: unknown) {
 
 function apiUrl(pathname: string) {
   return SERVER_URL ? `${SERVER_URL}${pathname}` : pathname
+}
+
+function replaceEmojiShortcodes(value: string) {
+  return value.replace(EMOJI_SHORTCODE_PATTERN, (match, shortcode: string) => EMOJI_BY_SHORTCODE.get(shortcode.toLowerCase()) ?? match)
+}
+
+function getEmojiSuggestions(value: string) {
+  const match = value.match(ACTIVE_EMOJI_TOKEN_PATTERN)
+
+  if (!match) {
+    return []
+  }
+
+  const query = match[1].toLowerCase()
+
+  return EMOJI_OPTIONS.filter((option) => {
+    const terms = [option.name, ...(option.aliases ?? []), ...(option.keywords ?? [])]
+    return query.length === 0 || terms.some((term) => term.toLowerCase().startsWith(query))
+  }).slice(0, 7)
+}
+
+function insertEmojiSuggestion(value: string, emoji: string) {
+  return value.replace(ACTIVE_EMOJI_TOKEN_PATTERN, (token) => `${token.startsWith(' ') ? ' ' : ''}${emoji} `)
 }
 
 function App() {
@@ -271,7 +349,8 @@ function App() {
     : 'simple'
   const isOwner = roomState?.ownerId === clientId
   const memberCount = roomState?.members.length ?? 0
-  const recentMessages = useMemo(() => roomState?.messages.slice(-8) ?? [], [roomState?.messages])
+  const recentMessages = useMemo(() => roomState?.messages.slice(-10) ?? [], [roomState?.messages])
+  const emojiSuggestions = useMemo(() => (chatOpen ? getEmojiSuggestions(chatDraft) : []), [chatDraft, chatOpen])
   const shareUrl = useMemo(() => `${window.location.origin}${window.location.pathname}${window.location.search}#${roomId}`, [roomId])
   const effectiveStatus = currentVideo ? roomState?.playback.status ?? playerStatus : 'paused'
   const audibleVolume = muted ? 0 : volume
@@ -310,6 +389,11 @@ function App() {
     setChatOpen(true)
     setFullscreenIdle(false)
     chatInputRef.current?.focus({ preventScroll: true })
+  }, [])
+
+  const applyEmojiSuggestion = useCallback((option: EmojiOption) => {
+    setChatDraft((currentDraft) => insertEmojiSuggestion(currentDraft, option.emoji))
+    window.requestAnimationFrame(() => chatInputRef.current?.focus({ preventScroll: true }))
   }, [])
 
   const clearQualityRetryTimers = useCallback(() => {
@@ -1162,7 +1246,7 @@ function App() {
   const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    const body = chatDraft.trim()
+    const body = replaceEmojiShortcodes(chatDraft).trim()
 
     if (!body) {
       setChatOpen(false)
@@ -1173,6 +1257,19 @@ function App() {
     setChatDraft('')
     setChatOpen(false)
     chatInputRef.current?.blur()
+  }
+
+  const handleChatInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Escape') {
+      setChatOpen(false)
+      chatInputRef.current?.blur()
+      return
+    }
+
+    if (event.key === 'Tab' && emojiSuggestions[0]) {
+      event.preventDefault()
+      applyEmojiSuggestion(emojiSuggestions[0])
+    }
   }
 
   const handleGlassPointerMove = (event: ReactPointerEvent<HTMLElement>) => {
@@ -1392,11 +1489,30 @@ function App() {
                   <span className="chat-author" style={{ color: message.color }}>
                     {message.name}
                   </span>
-                  <span className="chat-body">{message.body}</span>
+                  <span className="chat-body">{replaceEmojiShortcodes(message.body)}</span>
                   <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                 </article>
               ))}
             </div>
+
+            {emojiSuggestions.length > 0 && (
+              <div className="emoji-suggestions" role="listbox" aria-label="Emoji suggestions">
+                {emojiSuggestions.map((option) => (
+                  <button
+                    className="emoji-suggestion"
+                    key={option.name}
+                    type="button"
+                    onMouseDown={(event) => event.preventDefault()}
+                    onClick={() => applyEmojiSuggestion(option)}
+                    role="option"
+                    aria-label={`Use :${option.name}:`}
+                  >
+                    <span className="emoji-symbol" aria-hidden="true">{option.emoji}</span>
+                    <span>:{option.name}:</span>
+                  </button>
+                ))}
+              </div>
+            )}
 
             <form className={`chat-composer ${chatOpen ? 'is-open' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
               <MessageCircle size={18} aria-hidden="true" />
@@ -1404,12 +1520,7 @@ function App() {
                 ref={chatInputRef}
                 value={chatDraft}
                 onChange={(event) => setChatDraft(event.currentTarget.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Escape') {
-                    setChatOpen(false)
-                    chatInputRef.current?.blur()
-                  }
-                }}
+                onKeyDown={handleChatInputKeyDown}
                 placeholder="Message the room"
                 aria-label="Message the room"
                 enterKeyHint="send"

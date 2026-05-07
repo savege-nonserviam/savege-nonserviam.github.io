@@ -19,8 +19,71 @@ const STALE_PLAYBACK_RESET_GRACE_SECONDS = 30
 const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
 const MAX_OWNER_EVENT_FUTURE_MS = 1000
 const OWNER_EVENT_REORDER_GRACE_MS = 1200
+const MAX_CHAT_BODY_LENGTH = 400
 const MEMBER_COLORS = ['#ff5d5d', '#f7c948', '#58d7b4', '#78a6ff', '#d58cff', '#ff9b6a']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
+const EMOJI_SHORTCODES = new Map([
+  ['smile', '🙂'],
+  ['happy', '🙂'],
+  ['grin', '😀'],
+  ['grinning', '😀'],
+  ['joy', '😂'],
+  ['laugh', '😂'],
+  ['lol', '😂'],
+  ['rofl', '🤣'],
+  ['lmao', '🤣'],
+  ['wink', '😉'],
+  ['blush', '😊'],
+  ['cute', '😊'],
+  ['heart', '❤️'],
+  ['love', '❤️'],
+  ['fire', '🔥'],
+  ['lit', '🔥'],
+  ['clap', '👏'],
+  ['applause', '👏'],
+  ['thumbsup', '👍'],
+  ['thumbs_up', '👍'],
+  ['+1', '👍'],
+  ['thumbsdown', '👎'],
+  ['thumbs_down', '👎'],
+  ['-1', '👎'],
+  ['ok', '👌'],
+  ['ok_hand', '👌'],
+  ['pray', '🙏'],
+  ['please', '🙏'],
+  ['party', '🥳'],
+  ['partying', '🥳'],
+  ['eyes', '👀'],
+  ['sob', '😭'],
+  ['cry', '😭'],
+  ['angry', '😡'],
+  ['mad', '😡'],
+  ['skull', '💀'],
+  ['dead', '💀'],
+  ['cool', '😎'],
+  ['sunglasses', '😎'],
+  ['thinking', '🤔'],
+  ['think', '🤔'],
+  ['wave', '👋'],
+  ['hello', '👋'],
+  ['rocket', '🚀'],
+  ['star', '⭐'],
+  ['check', '✅'],
+  ['done', '✅'],
+  ['x', '❌'],
+  ['cross', '❌'],
+  ['warning', '⚠️'],
+  ['warn', '⚠️'],
+  ['popcorn', '🍿'],
+  ['100', '💯'],
+  ['hundred', '💯'],
+  ['sparkles', '✨'],
+  ['shine', '✨'],
+  ['coffee', '☕'],
+  ['music', '🎵'],
+  ['note', '🎵'],
+  ['crown', '👑'],
+])
 
 const app = express()
 const httpServer = createServer(app)
@@ -287,7 +350,7 @@ io.on('connection', (socket) => {
       return
     }
 
-    const body = cleanText(payload?.body, 400)
+    const body = normalizeChatBody(payload?.body)
 
     if (!body) {
       return
@@ -725,6 +788,14 @@ function normalizeRoomId(value) {
 function normalizeName(value) {
   const name = cleanText(value, 24)
   return name || `Viewer ${Math.floor(100 + Math.random() * 900)}`
+}
+
+function normalizeChatBody(value) {
+  return replaceEmojiShortcodes(cleanText(value, MAX_CHAT_BODY_LENGTH)).slice(0, MAX_CHAT_BODY_LENGTH).trim()
+}
+
+function replaceEmojiShortcodes(value) {
+  return value.replace(/:([a-z0-9_+-]{1,32}):/gi, (match, shortcode) => EMOJI_SHORTCODES.get(shortcode.toLowerCase()) ?? match)
 }
 
 function normalizeVideo(value) {
