@@ -226,18 +226,8 @@ const EMOJI_OPTIONS: EmojiOption[] = [
   { name: 'music', emoji: '🎵', aliases: ['note'], keywords: ['song'] },
   { name: 'crown', emoji: '👑', keywords: ['owner'] },
 ]
-const EMOJI_BY_SHORTCODE = new Map(
-  EMOJI_OPTIONS.reduce<Array<[string, string]>>((entries, option) => {
-    entries.push([option.name, option.emoji])
-
-    for (const alias of option.aliases ?? []) {
-      entries.push([alias, option.emoji])
-    }
-
-    return entries
-  }, []),
-)
 const EMOJI_SHORTCODE_PATTERN = /:([a-z0-9_+-]{1,32}):/gi
+const PARTIAL_EMOJI_TOKEN_PATTERN = /(^|\s):([a-z0-9_+-]{1,32})(?=\s|$)/gi
 const ACTIVE_EMOJI_TOKEN_PATTERN = /(?:^|\s):([a-z0-9_+-]{0,24})$/i
 
 let youtubeApiPromise: Promise<void> | null = null
@@ -273,8 +263,13 @@ function apiUrl(pathname: string) {
   return SERVER_URL ? `${SERVER_URL}${pathname}` : pathname
 }
 
-function replaceEmojiShortcodes(value: string) {
-  return value.replace(EMOJI_SHORTCODE_PATTERN, (match, shortcode: string) => EMOJI_BY_SHORTCODE.get(shortcode.toLowerCase()) ?? match)
+function resolveEmojiShortcodes(value: string) {
+  return value
+    .replace(EMOJI_SHORTCODE_PATTERN, (match, shortcode: string) => findEmojiOption(shortcode)?.emoji ?? match)
+    .replace(PARTIAL_EMOJI_TOKEN_PATTERN, (match, prefix: string, shortcode: string) => {
+      const option = findEmojiOption(shortcode)
+      return option ? `${prefix}${option.emoji}` : match
+    })
 }
 
 function getEmojiSuggestions(value: string) {
@@ -285,11 +280,57 @@ function getEmojiSuggestions(value: string) {
   }
 
   const query = match[1].toLowerCase()
+  const options = query ? getRankedEmojiOptions(query) : EMOJI_OPTIONS
 
-  return EMOJI_OPTIONS.filter((option) => {
-    const terms = [option.name, ...(option.aliases ?? []), ...(option.keywords ?? [])]
-    return query.length === 0 || terms.some((term) => term.toLowerCase().startsWith(query))
-  }).slice(0, 7)
+  return options.slice(0, 5)
+}
+
+function getRankedEmojiOptions(query: string) {
+  return EMOJI_OPTIONS.map((option) => ({ option, score: scoreEmojiOption(option, query) }))
+    .filter((entry) => entry.score > 0)
+    .sort((leftEntry, rightEntry) => rightEntry.score - leftEntry.score)
+    .map((entry) => entry.option)
+}
+
+function findEmojiOption(query: string) {
+  return getRankedEmojiOptions(query.toLowerCase())[0] ?? null
+}
+
+function scoreEmojiOption(option: EmojiOption, query: string) {
+  const terms = [option.name, ...(option.aliases ?? []), ...(option.keywords ?? [])]
+  return Math.max(...terms.map((term) => scoreEmojiTerm(term.toLowerCase(), query)))
+}
+
+function scoreEmojiTerm(term: string, query: string) {
+  if (!query) {
+    return 1
+  }
+
+  if (term === query) {
+    return 100
+  }
+
+  if (term.startsWith(query)) {
+    return 80 - Math.min(20, term.length - query.length)
+  }
+
+  if (term.includes(query)) {
+    return 58 - Math.min(18, term.indexOf(query))
+  }
+
+  return isSubsequence(query, term) ? 32 - Math.min(12, term.length - query.length) : 0
+}
+
+function isSubsequence(query: string, term: string) {
+  let queryIndex = 0
+
+  for (const character of term) {
+    if (character === query[queryIndex]) {
+      queryIndex += 1
+    }
+  }
+
+  return queryIndex === query.length
 }
 
 function insertEmojiSuggestion(value: string, emoji: string) {
@@ -1246,7 +1287,7 @@ function App() {
   const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
-    const body = replaceEmojiShortcodes(chatDraft).trim()
+    const body = resolveEmojiShortcodes(chatDraft).trim()
 
     if (!body) {
       setChatOpen(false)
@@ -1489,32 +1530,13 @@ function App() {
                   <span className="chat-author" style={{ color: message.color }}>
                     {message.name}
                   </span>
-                  <span className="chat-body">{replaceEmojiShortcodes(message.body)}</span>
+                  <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>
                   <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                 </article>
               ))}
             </div>
 
-            {emojiSuggestions.length > 0 && (
-              <div className="emoji-suggestions" role="listbox" aria-label="Emoji suggestions">
-                {emojiSuggestions.map((option) => (
-                  <button
-                    className="emoji-suggestion"
-                    key={option.name}
-                    type="button"
-                    onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => applyEmojiSuggestion(option)}
-                    role="option"
-                    aria-label={`Use :${option.name}:`}
-                  >
-                    <span className="emoji-symbol" aria-hidden="true">{option.emoji}</span>
-                    <span>:{option.name}:</span>
-                  </button>
-                ))}
-              </div>
-            )}
-
-            <form className={`chat-composer ${chatOpen ? 'is-open' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
+            <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
               <MessageCircle size={18} aria-hidden="true" />
               <input
                 ref={chatInputRef}
@@ -1527,6 +1549,24 @@ function App() {
                 autoCapitalize="sentences"
                 maxLength={400}
               />
+              {emojiSuggestions.length > 0 && (
+                <div className="emoji-suggestions" role="listbox" aria-label="Emoji suggestions">
+                  {emojiSuggestions.map((option) => (
+                    <button
+                      className="emoji-suggestion"
+                      key={option.name}
+                      type="button"
+                      onMouseDown={(event) => event.preventDefault()}
+                      onClick={() => applyEmojiSuggestion(option)}
+                      role="option"
+                      title={`:${option.name}:`}
+                      aria-label={`Use :${option.name}:`}
+                    >
+                      <span className="emoji-symbol" aria-hidden="true">{option.emoji}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               <button className="icon-button send-button" type="submit" title="Send" aria-label="Send message">
                 <Send size={17} aria-hidden="true" />
               </button>

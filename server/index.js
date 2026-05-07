@@ -795,7 +795,67 @@ function normalizeChatBody(value) {
 }
 
 function replaceEmojiShortcodes(value) {
-  return value.replace(/:([a-z0-9_+-]{1,32}):/gi, (match, shortcode) => EMOJI_SHORTCODES.get(shortcode.toLowerCase()) ?? match)
+  return value
+    .replace(/:([a-z0-9_+-]{1,32}):/gi, (match, shortcode) => findClosestEmoji(shortcode) || match)
+    .replace(/(^|\s):([a-z0-9_+-]{1,32})(?=\s|$)/gi, (match, prefix, shortcode) => {
+      const emoji = findClosestEmoji(shortcode)
+      return emoji ? `${prefix}${emoji}` : match
+    })
+}
+
+function findClosestEmoji(shortcode) {
+  const query = String(shortcode ?? '').toLowerCase()
+  const exactEmoji = EMOJI_SHORTCODES.get(query)
+
+  if (exactEmoji) {
+    return exactEmoji
+  }
+
+  let bestEmoji = ''
+  let bestScore = 0
+
+  for (const [term, emoji] of EMOJI_SHORTCODES.entries()) {
+    const score = scoreEmojiTerm(term, query)
+
+    if (score > bestScore) {
+      bestScore = score
+      bestEmoji = emoji
+    }
+  }
+
+  return bestEmoji
+}
+
+function scoreEmojiTerm(term, query) {
+  if (!query) {
+    return 0
+  }
+
+  if (term === query) {
+    return 100
+  }
+
+  if (term.startsWith(query)) {
+    return 80 - Math.min(20, term.length - query.length)
+  }
+
+  if (term.includes(query)) {
+    return 58 - Math.min(18, term.indexOf(query))
+  }
+
+  return isSubsequence(query, term) ? 32 - Math.min(12, term.length - query.length) : 0
+}
+
+function isSubsequence(query, term) {
+  let queryIndex = 0
+
+  for (const character of term) {
+    if (character === query[queryIndex]) {
+      queryIndex += 1
+    }
+  }
+
+  return queryIndex === query.length
 }
 
 function normalizeVideo(value) {
