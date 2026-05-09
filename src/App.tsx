@@ -1250,6 +1250,12 @@ function App() {
   }
 
   const handleMobileChatButton = () => {
+    if (chatOpen) {
+      setChatOpen(false)
+      chatInputRef.current?.blur()
+      return
+    }
+
     openChatInput()
   }
 
@@ -1626,8 +1632,8 @@ function App() {
                 className={`icon-button control-icon mobile-chat-toggle ${chatOpen ? 'is-active' : ''}`}
                 type="button"
                 onClick={handleMobileChatButton}
-                title="Chat"
-                aria-label="Open chat"
+                title={chatOpen ? 'Close chat' : 'Chat'}
+                aria-label={chatOpen ? 'Close chat' : 'Open chat'}
               >
                 <MessageCircle size={17} aria-hidden="true" />
               </button>
@@ -1638,7 +1644,7 @@ function App() {
                 const messageIsOwn = message.clientId === clientId
 
                 return (
-                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'}`} key={message.id} style={{ '--chat-color': messageIsOwn ? '#59d6bd' : message.color } as CSSProperties}>
+                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'}`} key={message.id} style={{ '--chat-color': message.color } as CSSProperties}>
                     <span className="chat-author">
                       <span className="chat-author-dot" aria-hidden="true" />
                       <span>{messageIsOwn ? 'You' : message.name}</span>

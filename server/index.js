@@ -20,7 +20,7 @@ const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
 const MAX_OWNER_EVENT_FUTURE_MS = 1000
 const OWNER_EVENT_REORDER_GRACE_MS = 1200
 const MAX_CHAT_BODY_LENGTH = 400
-const MEMBER_COLORS = ['#ff6b6b', '#ffd166', '#06d6a0', '#4dabf7', '#b197fc', '#ff922b', '#f06595', '#66d9e8', '#c0eb75', '#ffa8a8']
+const MEMBER_COLORS = ['#ff5c7a', '#ffc857', '#32d583', '#33d6ff', '#7c9cff', '#b784ff', '#ff7ac8', '#ff9f45', '#9be15d', '#00e5d4', '#f79009', '#d0e85d']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
 const EMOJI_SHORTCODES = new Map([
   ['smile', '🙂'],
@@ -311,7 +311,7 @@ io.on('connection', (socket) => {
     const member = existingMember ?? {
       clientId,
       name,
-      color: colorForClient(clientId),
+      color: colorForClient(clientId, room),
       connected: true,
       socketId: socket.id,
       lastSeen: Date.now(),
@@ -939,14 +939,62 @@ function validateYouTubeId(value) {
   return /^[a-zA-Z0-9_-]{11}$/.test(videoId) ? videoId : ''
 }
 
-function colorForClient(clientId) {
+function colorForClient(clientId, room = null) {
+  const hash = hashClientId(clientId)
+  const startIndex = hash % MEMBER_COLORS.length
+  const usedColors = room ? connectedMembers(room).map((member) => member.color) : []
+
+  for (let offset = 0; offset < MEMBER_COLORS.length; offset += 1) {
+    const color = MEMBER_COLORS[(startIndex + offset) % MEMBER_COLORS.length]
+
+    if (!usedColors.some((usedColor) => colorsAreTooSimilar(color, usedColor))) {
+      return color
+    }
+  }
+
+  return MEMBER_COLORS[startIndex]
+}
+
+function hashClientId(clientId) {
   let hash = 0
 
   for (const character of clientId) {
     hash = (hash * 31 + character.charCodeAt(0)) >>> 0
   }
 
-  return MEMBER_COLORS[hash % MEMBER_COLORS.length]
+  return hash
+}
+
+function colorsAreTooSimilar(color, otherColor) {
+  const currentRgb = rgbFromHexColor(color)
+  const otherRgb = rgbFromHexColor(otherColor)
+
+  if (!currentRgb || !otherRgb) {
+    return color === otherColor
+  }
+
+  const redDelta = currentRgb.red - otherRgb.red
+  const greenDelta = currentRgb.green - otherRgb.green
+  const blueDelta = currentRgb.blue - otherRgb.blue
+  const distance = Math.sqrt(redDelta * redDelta + greenDelta * greenDelta + blueDelta * blueDelta)
+
+  return distance < 112
+}
+
+function rgbFromHexColor(color) {
+  const match = String(color ?? '').match(/^#([0-9a-f]{6})$/i)
+
+  if (!match) {
+    return null
+  }
+
+  const value = Number.parseInt(match[1], 16)
+
+  return {
+    red: (value >> 16) & 255,
+    green: (value >> 8) & 255,
+    blue: value & 255,
+  }
 }
 
 function formatIsoDuration(duration) {
