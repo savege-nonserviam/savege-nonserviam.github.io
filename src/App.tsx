@@ -1547,7 +1547,11 @@ function App() {
               )}
               {miniPlayerActive && currentVideo && (
                 <div className="mini-player-topbar" onPointerUp={(event) => event.stopPropagation()}>
-                  <span className="mini-player-title">{currentVideo.title}</span>
+                  <span className={`mini-player-status ${effectiveStatus === 'playing' ? 'is-playing' : 'is-paused'}`} aria-hidden="true" />
+                  <span className="mini-player-copy">
+                    <span className="mini-player-title">{currentVideo.title}</span>
+                    <span className="mini-player-author">{currentVideo.author}</span>
+                  </span>
                   <button className="icon-button mini-restore-button" type="button" onClick={handleToggleMiniPlayer} title="Return to player" aria-label="Return to full player">
                     <Maximize2 size={15} aria-hidden="true" />
                   </button>
