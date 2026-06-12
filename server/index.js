@@ -11,7 +11,7 @@ const PORT = Number(process.env.PORT ?? 3001)
 const ROOM_IDLE_TTL_MS = 10 * 60 * 1000
 const EMPTY_ROOM_DELETE_DELAY_MS = 0
 const OWNER_GRACE_MS = 12 * 1000
-const MAX_MESSAGES = 80
+const MAX_MESSAGES = 70
 const MAX_SEARCH_RESULTS = 10
 const YOUTUBE_SEARCH_FETCH_LIMIT = 20
 const PLAYBACK_END_BUFFER_SECONDS = 0.75
@@ -20,7 +20,10 @@ const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
 const MAX_OWNER_EVENT_FUTURE_MS = 1000
 const OWNER_EVENT_REORDER_GRACE_MS = 1200
 const MAX_CHAT_BODY_LENGTH = 400
-const MEMBER_COLORS = ['#ff5c7a', '#ffc857', '#32d583', '#33d6ff', '#7c9cff', '#b784ff', '#ff7ac8', '#ff9f45', '#9be15d', '#00e5d4', '#f79009', '#d0e85d']
+const MAX_CHAT_IMAGE_BYTES = 700 * 1024
+const MAX_CHAT_IMAGE_DIMENSION = 1600
+const MAX_SOCKET_PAYLOAD_BYTES = 1_200_000
+const MEMBER_COLORS = ['#ff5c66', '#f2bf5b', '#5ee0c6', '#69a7ff', '#b99cff', '#ff8abf', '#a5dc6d', '#7dd3fc']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
 const EMOJI_SHORTCODES = new Map([
   ['smile', '🙂'],
@@ -37,6 +40,35 @@ const EMOJI_SHORTCODES = new Map([
   ['cute', '😊'],
   ['heart', '❤️'],
   ['love', '❤️'],
+  ['heart_eyes', '😍'],
+  ['starstruck', '🤩'],
+  ['mindblown', '🤯'],
+  ['shock', '😮'],
+  ['wow', '😮'],
+  ['melting', '🫠'],
+  ['salute', '🫡'],
+  ['facepalm', '🤦'],
+  ['shrug', '🤷'],
+  ['yikes', '😬'],
+  ['scream', '😱'],
+  ['sleepy', '😴'],
+  ['zzz', '😴'],
+  ['plead', '🥺'],
+  ['hug', '🫶'],
+  ['brokenheart', '💔'],
+  ['pin', '📌'],
+  ['camera', '📸'],
+  ['image', '🖼️'],
+  ['movie', '🎬'],
+  ['cinema', '🎬'],
+  ['tv', '📺'],
+  ['rewind', '⏪'],
+  ['forward', '⏩'],
+  ['pause', '⏸️'],
+  ['play', '▶️'],
+  ['sync', '🔁'],
+  ['trust', '🛡️'],
+  ['shield', '🛡️'],
   ['fire', '🔥'],
   ['lit', '🔥'],
   ['clap', '👏'],
@@ -94,6 +126,7 @@ const corsOrigins = Array.from(new Set([...DEFAULT_CORS_ORIGINS, ...configuredCo
 
 const io = new Server(httpServer, {
   cors: { origin: corsOrigins, credentials: true },
+  maxHttpBufferSize: MAX_SOCKET_PAYLOAD_BYTES,
 })
 
 const rooms = new Map()
@@ -313,6 +346,7 @@ io.on('connection', (socket) => {
       name,
       color: colorForClient(clientId, room),
       connected: true,
+      trusted: false,
       socketId: socket.id,
       lastSeen: Date.now(),
     }
@@ -331,6 +365,7 @@ io.on('connection', (socket) => {
     if (room.ownerId === clientId) {
       clearOwnerPromotion(room)
       room.ownerName = name
+      member.trusted = false
     }
 
     socket.data.roomId = roomId
@@ -351,8 +386,9 @@ io.on('connection', (socket) => {
     }
 
     const body = normalizeChatBody(payload?.body)
+    const image = normalizeChatImage(payload?.image)
 
-    if (!body) {
+    if (!body && !image) {
       return
     }
 
@@ -362,6 +398,7 @@ io.on('connection', (socket) => {
       name: member.name,
       color: member.color,
       body,
+      image,
       createdAt: Date.now(),
     }
 
@@ -392,10 +429,37 @@ io.on('connection', (socket) => {
     io.to(room.id).emit('room:state', state)
   })
 
-  socket.on('owner:loadVideo', (payload) => {
+  socket.on('owner:setTrusted', (payload, reply) => {
     const room = getSocketRoom(socket)
 
     if (!ensureOwner(socket, room)) {
+      reply?.({ ok: false, message: 'Only the room owner can trust viewers.' })
+      return
+    }
+
+    const targetClientId = cleanText(payload?.clientId, 80)
+    const targetMember = room.members.get(targetClientId)
+
+    if (!targetMember?.connected || targetMember.clientId === room.ownerId) {
+      reply?.({ ok: false, message: 'Choose a connected viewer.' })
+      return
+    }
+
+    targetMember.trusted = payload?.trusted === true
+
+    if (!targetMember.trusted && room.controllerId === targetMember.clientId) {
+      room.controllerId = room.ownerId
+    }
+
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('owner:loadVideo', (payload) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
       return
     }
 
@@ -413,13 +477,14 @@ io.on('connection', (socket) => {
     room.status = payload?.status === 'playing' ? 'playing' : 'paused'
     room.baseTime = clampPlaybackTime(normalizeSeconds(payload?.currentTime, 0), room.video)
     room.updatedAt = actionTime
+    setRoomController(room, socket)
     broadcastRoom(room)
   })
 
   socket.on('owner:updateVideoMeta', (payload) => {
     const room = getSocketRoom(socket)
 
-    if (!ensureOwner(socket, room) || !room.video) {
+    if (!ensureController(socket, room) || !room.video) {
       return
     }
 
@@ -444,7 +509,7 @@ io.on('connection', (socket) => {
   socket.on('owner:seek', (payload) => {
     const room = getSocketRoom(socket)
 
-    if (!ensurePlaybackMember(socket, room) || !room.video) {
+    if (!ensureController(socket, room) || !room.video) {
       return
     }
 
@@ -457,13 +522,14 @@ io.on('connection', (socket) => {
 
     room.baseTime = clampPlaybackTime(normalizeSeconds(payload?.currentTime, getRoomPlaybackTime(room, actionTime)), room.video)
     room.updatedAt = actionTime
+    setRoomController(room, socket)
     broadcastRoom(room)
   })
 
   socket.on('owner:heartbeat', (payload) => {
     const room = getSocketRoom(socket)
 
-    if (!ensureOwner(socket, room) || !room.video) {
+    if (!ensureActiveController(socket, room) || !room.video) {
       return
     }
 
@@ -579,6 +645,7 @@ function getOrCreateRoom(roomId) {
     status: 'paused',
     baseTime: 0,
     updatedAt: Date.now(),
+    controllerId: '',
     messages: [],
     cleanupTimer: null,
     ownerPromotionTimer: null,
@@ -628,6 +695,10 @@ function leaveCurrentRoom(socket) {
     scheduleOwnerPromotion(room)
   }
 
+  if (room.controllerId === clientId) {
+    room.controllerId = room.ownerId === clientId ? '' : room.ownerId
+  }
+
   const roomDeleted = scheduleRoomCleanup(room)
 
   if (!roomDeleted) {
@@ -637,25 +708,49 @@ function leaveCurrentRoom(socket) {
 
 function ensureOwner(socket, room) {
   if (!room || socket.data.clientId !== room.ownerId) {
-    emitRoomError(socket, 'OWNER_REQUIRED', 'Only the room owner can change the video.')
+    emitRoomError(socket, 'OWNER_REQUIRED', 'Only the room owner can manage trusted viewers.')
     return false
   }
 
   return true
 }
 
-function ensurePlaybackMember(socket, room) {
-  if (!room || !getSocketMember(socket, room)?.connected) {
+function ensureController(socket, room) {
+  const member = getSocketMember(socket, room)
+
+  if (!room || !member?.connected || (member.clientId !== room.ownerId && !member.trusted)) {
+    emitRoomError(socket, 'CONTROLLER_REQUIRED', 'Only the room owner or trusted viewers can control playback.')
     return false
   }
 
   return true
+}
+
+function ensureActiveController(socket, room) {
+  if (!ensureController(socket, room)) {
+    return false
+  }
+
+  const clientId = socket.data.clientId
+
+  if (!room.controllerId) {
+    room.controllerId = clientId
+    return true
+  }
+
+  return room.controllerId === clientId
+}
+
+function setRoomController(room, socket) {
+  if (socket.data.clientId) {
+    room.controllerId = socket.data.clientId
+  }
 }
 
 function updateOwnerPlayback(socket, status, payload) {
   const room = getSocketRoom(socket)
 
-  if (!ensurePlaybackMember(socket, room) || !room.video) {
+  if (!ensureController(socket, room) || !room.video) {
     return
   }
 
@@ -669,6 +764,7 @@ function updateOwnerPlayback(socket, status, payload) {
   room.status = status
   room.baseTime = clampPlaybackTime(normalizeSeconds(payload?.currentTime, getRoomPlaybackTime(room, actionTime)), room.video)
   room.updatedAt = actionTime
+  setRoomController(room, socket)
   broadcastRoom(room)
 }
 
@@ -683,16 +779,20 @@ function broadcastRoom(room) {
 function serializeRoom(room) {
   const serverTime = Date.now()
   const owner = room.members.get(room.ownerId)
+  const controller = getRoomController(room)
 
   return {
     id: room.id,
     ownerId: room.ownerId,
     ownerName: owner?.name || room.ownerName,
+    controllerId: controller?.clientId ?? room.ownerId,
+    controllerName: controller?.name || owner?.name || room.ownerName,
     members: connectedMembers(room).map((member) => ({
       clientId: member.clientId,
       name: member.name,
       color: member.color,
       connected: member.connected,
+      trusted: Boolean(member.trusted),
     })),
     video: room.video,
     playback: {
@@ -710,6 +810,22 @@ function getRoomPlaybackTime(room, now = Date.now()) {
   }
 
   return clampPlaybackTime(Math.max(0, room.baseTime + (now - room.updatedAt) / 1000), room.video)
+}
+
+function getRoomController(room) {
+  const controller = room.members.get(room.controllerId)
+
+  if (controller?.connected && (controller.clientId === room.ownerId || controller.trusted)) {
+    return controller
+  }
+
+  const owner = room.members.get(room.ownerId)
+
+  if (owner?.connected) {
+    return owner
+  }
+
+  return connectedMembers(room).find((member) => member.trusted) ?? null
 }
 
 function normalizeOwnerEventTime(value, fallback = Date.now()) {
@@ -744,6 +860,8 @@ function scheduleOwnerPromotion(room) {
     if (nextOwner) {
       room.ownerId = nextOwner.clientId
       room.ownerName = nextOwner.name
+      nextOwner.trusted = false
+      room.controllerId = nextOwner.clientId
       broadcastRoom(room)
     }
   }, OWNER_GRACE_MS)
@@ -793,6 +911,10 @@ function pruneDisconnectedMembers(room) {
 
   for (const [clientId, member] of room.members.entries()) {
     if (!member.connected && member.lastSeen < cutoff && clientId !== room.ownerId) {
+      if (room.controllerId === clientId) {
+        room.controllerId = room.ownerId
+      }
+
       room.members.delete(clientId)
     }
   }
@@ -814,6 +936,41 @@ function normalizeName(value) {
 
 function normalizeChatBody(value) {
   return replaceEmojiShortcodes(cleanText(value, MAX_CHAT_BODY_LENGTH)).slice(0, MAX_CHAT_BODY_LENGTH).trim()
+}
+
+function normalizeChatImage(value) {
+  if (!value || typeof value !== 'object') {
+    return null
+  }
+
+  const dataUrl = String(value.dataUrl ?? '')
+  const match = dataUrl.match(/^data:(image\/(?:jpeg|jpg|png|webp));base64,([a-z0-9+/=]+)$/i)
+
+  if (!match) {
+    return null
+  }
+
+  const byteLength = Math.floor((match[2].length * 3) / 4)
+
+  if (byteLength <= 0 || byteLength > MAX_CHAT_IMAGE_BYTES) {
+    return null
+  }
+
+  const width = Math.round(Number(value.width))
+  const height = Math.round(Number(value.height))
+
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0 || width > MAX_CHAT_IMAGE_DIMENSION || height > MAX_CHAT_IMAGE_DIMENSION) {
+    return null
+  }
+
+  return {
+    dataUrl,
+    mimeType: match[1].toLowerCase().replace('image/jpg', 'image/jpeg'),
+    name: cleanText(value.name, 80),
+    width,
+    height,
+    size: byteLength,
+  }
 }
 
 function replaceEmojiShortcodes(value) {

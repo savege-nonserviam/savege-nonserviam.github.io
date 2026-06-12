@@ -6,6 +6,7 @@ import {
   useState,
   type CSSProperties,
   type ChangeEvent,
+  type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
@@ -14,6 +15,7 @@ import {
   Check,
   Copy,
   Crown,
+  Image as ImageIcon,
   Link as LinkIcon,
   LoaderCircle,
   Lock,
@@ -22,13 +24,17 @@ import {
   Minimize2,
   Pause,
   Play,
+  RotateCcw,
   Search as SearchIcon,
   Send,
+  ShieldCheck,
+  UserCheck,
   Users,
   Volume2,
   VolumeX,
   Wifi,
   WifiOff,
+  X,
 } from 'lucide-react'
 import { io } from 'socket.io-client'
 import type { Socket } from 'socket.io-client'
@@ -53,6 +59,16 @@ type RoomMember = {
   name: string
   color: string
   connected: boolean
+  trusted: boolean
+}
+
+type ChatImage = {
+  dataUrl: string
+  mimeType: string
+  name: string
+  width: number
+  height: number
+  size: number
 }
 
 type ChatMessage = {
@@ -61,6 +77,7 @@ type ChatMessage = {
   name: string
   color: string
   body: string
+  image?: ChatImage | null
   createdAt: number
 }
 
@@ -68,6 +85,8 @@ type RoomState = {
   id: string
   ownerId: string
   ownerName: string
+  controllerId: string
+  controllerName: string
   members: RoomMember[]
   video: VideoMeta | null
   playback: {
@@ -90,6 +109,7 @@ type SearchResult = VideoMeta & {
 }
 
 type SearchResponse = {
+  code?: string
   results?: SearchResult[]
   message?: string
 }
@@ -115,6 +135,8 @@ type YouTubePlayer = {
   seekTo: (seconds: number, allowSeekAhead: boolean) => void
   getAvailableQualityLevels?: () => string[]
   setPlaybackQuality?: (suggestedQuality: string) => void
+  getPlaybackRate?: () => number
+  setPlaybackRate?: (suggestedRate: number) => void
   getVolume: () => number
   setVolume: (volume: number) => void
   mute: () => void
@@ -179,10 +201,18 @@ const SYNC_INTERVAL_MS = 500
 const HEARTBEAT_INTERVAL_MS = 1000
 const CLOCK_SYNC_INTERVAL_MS = 2500
 const CLOCK_SAMPLE_LIMIT = 12
+const SYNC_SOFT_DRIFT_SECONDS = 0.22
+const SYNC_HARD_DRIFT_SECONDS = 1.15
+const SYNC_RATE_NUDGE = 0.05
 const OWNER_TRANSIENT_PAUSE_GRACE_MS = 2400
 const OWNER_PLAY_COMMAND_GRACE_MS = 1500
 const MOBILE_DOUBLE_TAP_MS = 320
 const MOBILE_DOUBLE_TAP_DISTANCE_PX = 44
+const CHAT_IMAGE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
+const CHAT_IMAGE_MAX_BYTES = 700 * 1024
+const CHAT_IMAGE_MAX_DIMENSION = 1280
+const CHAT_IMAGE_QUALITY_STEPS = [0.84, 0.76, 0.68, 0.58]
+const MINI_PLAYER_DEFAULT_OFFSET = 20
 const PREFERRED_PLAYBACK_QUALITY = 'hd1080'
 const PLAYBACK_QUALITY_FALLBACKS = ['highres', 'hd720', 'large', 'medium', 'small', 'tiny', 'default']
 const QUALITY_RETRY_DELAYS_MS = [0, 350, 900, 1800, 3600]
@@ -201,6 +231,20 @@ const EMOJI_OPTIONS: EmojiOption[] = [
   { name: 'wink', emoji: '😉', keywords: ['joke'] },
   { name: 'blush', emoji: '😊', aliases: ['cute'], keywords: ['happy'] },
   { name: 'heart', emoji: '❤️', aliases: ['love'], keywords: ['like'] },
+  { name: 'heart_eyes', emoji: '😍', aliases: ['heart-eyes'], keywords: ['love'] },
+  { name: 'starstruck', emoji: '🤩', aliases: ['star_struck'], keywords: ['hype', 'wow'] },
+  { name: 'mindblown', emoji: '🤯', aliases: ['mind_blown'], keywords: ['wow'] },
+  { name: 'shock', emoji: '😮', aliases: ['wow'], keywords: ['surprise'] },
+  { name: 'melting', emoji: '🫠', aliases: ['melt'], keywords: ['awkward'] },
+  { name: 'salute', emoji: '🫡', aliases: ['respect'], keywords: ['yes'] },
+  { name: 'facepalm', emoji: '🤦', aliases: ['bruh'], keywords: ['oops'] },
+  { name: 'shrug', emoji: '🤷', aliases: ['idk'], keywords: ['maybe'] },
+  { name: 'yikes', emoji: '😬', aliases: ['grimace'], keywords: ['awkward'] },
+  { name: 'scream', emoji: '😱', aliases: ['scared'], keywords: ['shock'] },
+  { name: 'sleepy', emoji: '😴', aliases: ['zzz'], keywords: ['tired'] },
+  { name: 'plead', emoji: '🥺', aliases: ['please'], keywords: ['cute'] },
+  { name: 'hug', emoji: '🫶', aliases: ['hands_heart'], keywords: ['love'] },
+  { name: 'brokenheart', emoji: '💔', aliases: ['broken_heart'], keywords: ['sad'] },
   { name: 'fire', emoji: '🔥', aliases: ['lit'], keywords: ['hot'] },
   { name: 'clap', emoji: '👏', aliases: ['applause'], keywords: ['nice'] },
   { name: 'thumbsup', emoji: '👍', aliases: ['thumbs_up', '+1'], keywords: ['yes', 'like'] },
@@ -226,6 +270,17 @@ const EMOJI_OPTIONS: EmojiOption[] = [
   { name: 'coffee', emoji: '☕', keywords: ['drink'] },
   { name: 'music', emoji: '🎵', aliases: ['note'], keywords: ['song'] },
   { name: 'crown', emoji: '👑', keywords: ['owner'] },
+  { name: 'pin', emoji: '📌', aliases: ['pinned'], keywords: ['save'] },
+  { name: 'camera', emoji: '📸', aliases: ['screenshot'], keywords: ['image'] },
+  { name: 'image', emoji: '🖼️', aliases: ['picture'], keywords: ['photo'] },
+  { name: 'movie', emoji: '🎬', aliases: ['cinema'], keywords: ['video'] },
+  { name: 'tv', emoji: '📺', keywords: ['watch'] },
+  { name: 'rewind', emoji: '⏪', keywords: ['back'] },
+  { name: 'forward', emoji: '⏩', keywords: ['skip'] },
+  { name: 'pause', emoji: '⏸️', keywords: ['stop'] },
+  { name: 'play', emoji: '▶️', keywords: ['start'] },
+  { name: 'sync', emoji: '🔁', keywords: ['resync'] },
+  { name: 'trust', emoji: '🛡️', aliases: ['shield'], keywords: ['trusted'] },
 ]
 const EMOJI_SHORTCODE_PATTERN = /:([a-z0-9_+-]{1,32}):/gi
 const PARTIAL_EMOJI_TOKEN_PATTERN = /(^|\s):([a-z0-9_+-]{1,32})(?=\s|$)/gi
@@ -352,6 +407,7 @@ function App() {
   const [searchText, setSearchText] = useState('')
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
   const [searchError, setSearchError] = useState<string | null>(null)
+  const [searchAttempted, setSearchAttempted] = useState(false)
   const [searching, setSearching] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
   const [playerReady, setPlayerReady] = useState(false)
@@ -364,7 +420,11 @@ function App() {
   const [duration, setDuration] = useState(0)
   const [chatOpen, setChatOpen] = useState(false)
   const [chatDraft, setChatDraft] = useState('')
+  const [pendingImage, setPendingImage] = useState<ChatImage | null>(null)
+  const [previewImage, setPreviewImage] = useState<{ image: ChatImage; author: string } | null>(null)
+  const [uploadingImage, setUploadingImage] = useState(false)
   const [miniPlayerOpen, setMiniPlayerOpen] = useState(false)
+  const [miniPlayerPosition, setMiniPlayerPosition] = useState({ right: MINI_PLAYER_DEFAULT_OFFSET, bottom: MINI_PLAYER_DEFAULT_OFFSET })
   const [analyzedMaterial, setAnalyzedMaterial] = useState<{ source: string; complexity: MaterialComplexity } | null>(null)
   const [materialMotion, setMaterialMotion] = useState(false)
   const [scrollState, setScrollState] = useState<ScrollState>('top')
@@ -386,21 +446,40 @@ function App() {
   const videoShellRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
   const chatInputRef = useRef<HTMLInputElement | null>(null)
+  const imageInputRef = useRef<HTMLInputElement | null>(null)
 
   const currentVideo = roomState?.video ?? null
   const canConnect = displayName.length > 0
   const miniPlayerActive = miniPlayerOpen && Boolean(currentVideo)
+  const ownerName = roomState?.ownerName ?? ''
   const materialComplexity: MaterialComplexity = currentVideo?.thumbnail
     ? analyzedMaterial?.source === currentVideo.thumbnail
       ? analyzedMaterial.complexity
       : 'busy'
     : 'simple'
+  const currentMember = roomState?.members.find((member) => member.clientId === clientId) ?? null
   const isOwner = roomState?.ownerId === clientId
+  const canControlRoom = isOwner || Boolean(currentMember?.trusted)
   const memberCount = roomState?.members.length ?? 0
+  const trustedCount = roomState?.members.filter((member) => member.trusted).length ?? 0
   const recentMessages = useMemo(() => roomState?.messages.slice(-10) ?? [], [roomState?.messages])
   const emojiSuggestions = useMemo(() => (chatOpen ? getEmojiSuggestions(chatDraft) : []), [chatDraft, chatOpen])
   const shareUrl = useMemo(() => `${window.location.origin}${window.location.pathname}${window.location.search}#${roomId}`, [roomId])
   const effectiveStatus = currentVideo ? roomState?.playback.status ?? playerStatus : 'paused'
+  const controlUnavailableMessage = getControlUnavailableMessage(roomState)
+  const playbackControlTitle = !currentVideo ? 'Load a video first' : canControlRoom ? (effectiveStatus === 'playing' ? 'Pause' : 'Play') : controlUnavailableMessage
+  const roleLabel = isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted' : 'Guest'
+  const controllerName = roomState?.controllerName || ownerName
+  const timelineMax = Math.max(1, Math.floor(duration || displayTime || parseDurationSeconds(currentVideo?.duration) || 1))
+  const showSearchPanel = searchOpen && (searchResults.length > 0 || Boolean(searchError) || searching || searchAttempted)
+  const miniPlayerStyle = useMemo(
+    () =>
+      ({
+        '--mini-right': `${miniPlayerPosition.right}px`,
+        '--mini-bottom': `${miniPlayerPosition.bottom}px`,
+      }) as CSSProperties,
+    [miniPlayerPosition],
+  )
   const audibleVolume = muted ? 0 : volume
   const contentIsMoving = effectiveStatus === 'playing' || materialMotion
   const materialWeightTarget = materialComplexity === 'dense' ? 1 : materialComplexity === 'busy' ? 0.62 : 0.22
@@ -433,6 +512,10 @@ function App() {
 
   const serverNow = useCallback(() => Date.now() + serverOffsetRef.current, [])
 
+  useEffect(() => {
+    window.scrollTo(0, 0)
+  }, [])
+
   const openChatInput = useCallback(() => {
     setMiniPlayerOpen(false)
     setChatOpen(true)
@@ -443,6 +526,56 @@ function App() {
   const applyEmojiSuggestion = useCallback((option: EmojiOption) => {
     setChatDraft((currentDraft) => insertEmojiSuggestion(currentDraft, option.emoji))
     window.requestAnimationFrame(() => chatInputRef.current?.focus({ preventScroll: true }))
+  }, [])
+
+  const attachChatImage = useCallback(async (file: File) => {
+    setUploadingImage(true)
+
+    try {
+      const image = await prepareChatImage(file)
+      setPendingImage(image)
+      setChatOpen(true)
+      setMiniPlayerOpen(false)
+      window.requestAnimationFrame(() => chatInputRef.current?.focus({ preventScroll: true }))
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'Unable to attach this image.')
+    } finally {
+      setUploadingImage(false)
+      if (imageInputRef.current) {
+        imageInputRef.current.value = ''
+      }
+    }
+  }, [])
+
+  const handleChatPaste = useCallback(
+    (event: ReactClipboardEvent<HTMLInputElement>) => {
+      const imageFile = findClipboardImageFile(event.clipboardData)
+
+      if (!imageFile) {
+        return
+      }
+
+      event.preventDefault()
+      void attachChatImage(imageFile)
+    },
+    [attachChatImage],
+  )
+
+  const handleImageFileChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => {
+      const imageFile = Array.from(event.currentTarget.files ?? []).find((file) => file.type.startsWith('image/'))
+
+      if (imageFile) {
+        void attachChatImage(imageFile)
+      }
+    },
+    [attachChatImage],
+  )
+
+  const handleOpenImagePicker = useCallback(() => {
+    setMiniPlayerOpen(false)
+    setChatOpen(true)
+    imageInputRef.current?.click()
   }, [])
 
   const clearQualityRetryTimers = useCallback(() => {
@@ -536,10 +669,16 @@ function App() {
 
       const currentTime = safeCurrentTime(player)
       const driftSeconds = Math.abs(currentTime - targetTime)
-      const driftLimit = isOwner ? 2.5 : 0.55
+      const controlsThisPlayback = state.controllerId === clientId || (isOwner && !state.controllerId)
+      const driftLimit = controlsThisPlayback ? 2.5 : SYNC_HARD_DRIFT_SECONDS
 
       if (driftSeconds > driftLimit) {
         player.seekTo(targetTime, true)
+        setPlaybackRate(player, 1)
+      } else if (!controlsThisPlayback && state.playback.status === 'playing' && driftSeconds > SYNC_SOFT_DRIFT_SECONDS) {
+        setPlaybackRate(player, currentTime < targetTime ? 1 + SYNC_RATE_NUDGE : 1 - SYNC_RATE_NUDGE)
+      } else {
+        setPlaybackRate(player, 1)
       }
 
       const youtubeState = player.getPlayerState()
@@ -555,7 +694,7 @@ function App() {
         player.pauseVideo()
       }
     },
-    [estimatePlaybackTime, isOwner, playerError, playerReady, requestBestPlaybackQuality],
+    [clientId, estimatePlaybackTime, isOwner, playerError, playerReady, requestBestPlaybackQuality],
   )
 
   const playOwnerVideoNow = useCallback(
@@ -589,8 +728,8 @@ function App() {
 
   const loadVideo = useCallback(
     (video: VideoMeta, options: { play?: boolean } = {}) => {
-      if (!isOwner) {
-        setNotice('Only the owner can change the video.')
+      if (!canControlRoom) {
+        setNotice(getControlUnavailableMessage(roomStateRef.current))
         return
       }
 
@@ -609,9 +748,10 @@ function App() {
       setSearchOpen(false)
       setSearchResults([])
       setSearchError(null)
+      setSearchAttempted(false)
       setSearchText('')
     },
-    [isOwner, playOwnerVideoNow, serverNow],
+    [canControlRoom, playOwnerVideoNow, serverNow],
   )
 
   useEffect(() => {
@@ -766,7 +906,7 @@ function App() {
 
             const state = roomStateRef.current
 
-            if (state?.ownerId === clientId && state.video && playerState) {
+            if (state?.video && playerState && canControlPlaybackState(state, clientId)) {
               const isPlaying = event.data === playerState.PLAYING
               const isPaused = event.data === playerState.PAUSED || event.data === playerState.CUED || event.data === playerState.ENDED
               const isTransient = event.data === playerState.BUFFERING || event.data === playerState.UNSTARTED
@@ -797,7 +937,7 @@ function App() {
             setPlayerError(getYouTubePlayerErrorMessage(event.data))
             setPlayerStatus('paused')
 
-            if (roomStateRef.current?.ownerId === clientId) {
+            if (roomStateRef.current && canControlPlaybackState(roomStateRef.current, clientId)) {
               socket.emit('owner:pause', { currentTime: safeCurrentTime(event.target), serverTime: serverNow() })
             }
           },
@@ -844,7 +984,7 @@ function App() {
   }, [applyRoomStateToPlayer])
 
   useEffect(() => {
-    if (!isOwner || !playerReady) {
+    if (!canControlRoom || !playerReady) {
       return
     }
 
@@ -908,7 +1048,7 @@ function App() {
     }, HEARTBEAT_INTERVAL_MS)
 
     return () => window.clearInterval(intervalId)
-  }, [isOwner, playerReady, serverNow])
+  }, [canControlRoom, playerReady, serverNow])
 
   useEffect(() => {
     if (!notice) {
@@ -1122,6 +1262,13 @@ function App() {
     if (!trimmedSearch) {
       return
     }
+
+    if (!canControlRoom) {
+      setNotice(controlUnavailableMessage)
+      setSearchOpen(false)
+      return
+    }
+
     const videoId = parseYouTubeVideoId(trimmedSearch)
 
     if (videoId) {
@@ -1138,12 +1285,17 @@ function App() {
     setSearching(true)
     setSearchOpen(true)
     setSearchError(null)
+    setSearchAttempted(true)
 
     try {
       const response = await fetch(apiUrl(`/api/youtube/search?query=${encodeURIComponent(trimmedSearch)}`))
       const payload = (await response.json()) as SearchResponse
 
       if (!response.ok) {
+        if (payload.code === 'YOUTUBE_API_KEY_MISSING') {
+          throw new Error('Search is unavailable here. Paste a YouTube link instead.')
+        }
+
         throw new Error(payload.message ?? 'YouTube search failed.')
       }
 
@@ -1158,6 +1310,15 @@ function App() {
 
   const handleTogglePlayback = () => {
     if (!currentVideo) {
+      return
+    }
+
+    if (!canControlRoom) {
+      if (roomStateRef.current?.playback.status === 'playing') {
+        applyRoomStateToPlayer(roomStateRef.current)
+      }
+
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
       return
     }
 
@@ -1264,6 +1425,11 @@ function App() {
       return
     }
 
+    if (!canControlRoom) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
     const player = playerRef.current
     const nextTime = clampPlaybackTime(Number(event.currentTarget.value), currentVideo, isUsableYouTubePlayer(player) ? player : null)
 
@@ -1317,6 +1483,7 @@ function App() {
     setDisplayName(nextName)
     setNameDraft(nextName)
     setNameDialogOpen(false)
+    window.requestAnimationFrame(() => window.scrollTo(0, 0))
 
     if (connected && roomStateRef.current && nextName !== previousName) {
       socket.emit('member:updateName', { name: nextName }, (response: JoinResponse) => {
@@ -1335,6 +1502,33 @@ function App() {
   const handleEditName = () => {
     setNameDraft(displayName)
     setNameDialogOpen(true)
+  }
+
+  const handleToggleTrusted = (member: RoomMember) => {
+    if (!isOwner || member.clientId === clientId) {
+      return
+    }
+
+    socket.emit('owner:setTrusted', { clientId: member.clientId, trusted: !member.trusted }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to update trust.')
+    })
+  }
+
+  const handleResync = () => {
+    const state = roomStateRef.current
+
+    if (!state) {
+      return
+    }
+
+    setPlaybackRate(playerRef.current, 1)
+    applyRoomStateToPlayer(state)
+    setNotice(controllerName ? `Synced to ${controllerName}.` : 'Synced to the room.')
   }
 
   const handleToggleFullscreen = async () => {
@@ -1376,18 +1570,50 @@ function App() {
     setMiniPlayerOpen((wasOpen) => !wasOpen)
   }
 
+  const handleMiniPlayerPointerDown = (event: ReactPointerEvent<HTMLElement>) => {
+    if (!miniPlayerActive || (event.target instanceof Element && event.target.closest('button'))) {
+      return
+    }
+
+    event.preventDefault()
+
+    const shell = videoShellRef.current
+    const startX = event.clientX
+    const startY = event.clientY
+    const startRight = miniPlayerPosition.right
+    const startBottom = miniPlayerPosition.bottom
+    const shellWidth = shell?.offsetWidth ?? 500
+    const shellHeight = shell?.offsetHeight ?? 280
+
+    const handlePointerMove = (moveEvent: PointerEvent) => {
+      const nextRight = clampNumber(startRight - (moveEvent.clientX - startX), 8, Math.max(8, window.innerWidth - Math.min(180, shellWidth)))
+      const nextBottom = clampNumber(startBottom - (moveEvent.clientY - startY), 8, Math.max(8, window.innerHeight - Math.min(140, shellHeight)))
+
+      setMiniPlayerPosition({ right: nextRight, bottom: nextBottom })
+    }
+
+    const handlePointerUp = () => {
+      document.removeEventListener('pointermove', handlePointerMove)
+      document.removeEventListener('pointerup', handlePointerUp)
+    }
+
+    document.addEventListener('pointermove', handlePointerMove)
+    document.addEventListener('pointerup', handlePointerUp, { once: true })
+  }
+
   const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
     const body = resolveEmojiShortcodes(chatDraft).trim()
 
-    if (!body) {
+    if (!body && !pendingImage) {
       setChatOpen(false)
       chatInputRef.current?.blur()
       return
     }
-    socket.emit('chat:send', { body })
+    socket.emit('chat:send', { body, image: pendingImage })
     setChatDraft('')
+    setPendingImage(null)
     setChatOpen(false)
     chatInputRef.current?.blur()
   }
@@ -1431,10 +1657,19 @@ function App() {
       data-scroll-direction={scrollDirection}
       style={materialStyle}
     >
+      {currentVideo?.thumbnail && (
+        <div className="ambient-backdrop" aria-hidden="true">
+          <img src={currentVideo.thumbnail} alt="" />
+        </div>
+      )}
+
       <header className="titlebar">
         <div className="brand" aria-label="YouWatch">
           <span className="brand-mark">
-            <Play size={16} fill="currentColor" aria-hidden="true" />
+            <span className="brand-screen">
+              <Play size={15} fill="currentColor" aria-hidden="true" />
+            </span>
+            <span className="brand-orbit" aria-hidden="true" />
           </span>
           <span>YouWatch</span>
         </div>
@@ -1443,9 +1678,13 @@ function App() {
           <SearchIcon size={18} aria-hidden="true" />
           <input
             value={searchText}
-            onChange={(event) => setSearchText(event.currentTarget.value)}
+            onChange={(event) => {
+              setSearchText(event.currentTarget.value)
+              setSearchAttempted(false)
+              setSearchError(null)
+            }}
             onFocus={() => setSearchOpen(true)}
-            placeholder="Search YouTube or paste a link"
+            placeholder={canControlRoom ? 'Search YouTube or paste a link' : 'Ask the host to trust you for controls'}
             aria-label="Search YouTube or paste a link"
             enterKeyHint="search"
             autoComplete="off"
@@ -1454,10 +1693,11 @@ function App() {
             {searching ? <LoaderCircle size={17} className="spin" aria-hidden="true" /> : <SearchIcon size={17} aria-hidden="true" />}
           </button>
 
-          {searchOpen && (searchResults.length > 0 || searchError || searching) && (
+          {showSearchPanel && (
             <div className="search-panel">
               {searching && <div className="search-message">Searching YouTube...</div>}
               {searchError && <div className="search-message is-error">{searchError}</div>}
+              {!searching && !searchError && searchAttempted && searchResults.length === 0 && <div className="search-message">No videos found.</div>}
               {!searching && !searchError &&
                 searchResults.map((result) => (
                   <button
@@ -1473,7 +1713,7 @@ function App() {
                       <span>{result.author}</span>
                     </span>
                     {result.duration && <span className="duration-chip">{result.duration}</span>}
-                    {!isOwner && <Lock size={14} aria-hidden="true" />}
+                    {!canControlRoom && <Lock size={14} aria-hidden="true" />}
                   </button>
                 ))}
             </div>
@@ -1485,10 +1725,16 @@ function App() {
             <Users size={15} aria-hidden="true" />
             {displayName || 'Name'}
           </button>
-          <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title={isOwner ? 'Owner' : `Owner: ${roomState?.ownerName ?? 'joining'}`}>
-            <Crown size={15} aria-hidden="true" />
-            {isOwner ? 'Owner' : 'Guest'}
+          <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title={isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted controller' : `Owner: ${roomState?.ownerName ?? 'joining'}`}>
+            {isOwner ? <Crown size={15} aria-hidden="true" /> : currentMember?.trusted ? <ShieldCheck size={15} aria-hidden="true" /> : <Lock size={15} aria-hidden="true" />}
+            {roleLabel}
           </span>
+          {trustedCount > 0 && (
+            <span className="room-pill trusted-count-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title="Trusted viewers">
+              <UserCheck size={15} aria-hidden="true" />
+              {trustedCount}
+            </span>
+          )}
           <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title="Connected viewers">
             <Users size={15} aria-hidden="true" />
             {memberCount}
@@ -1502,15 +1748,20 @@ function App() {
 
       <main className="watch-layout">
         <section className="stage-section" aria-label="Watch room">
-          <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef}>
-            <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${isOwner ? 'is-owner' : ''}`} onPointerUp={handleVideoSurfacePointerUp}>
+          <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef} style={miniPlayerActive ? miniPlayerStyle : undefined}>
+            <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${canControlRoom ? 'can-control' : 'is-viewer'}`} onPointerUp={handleVideoSurfacePointerUp}>
               <div id={YOUTUBE_PLAYER_ID} className="youtube-player" />
               {!currentVideo && (
                 <div className="empty-player">
                   <span className="empty-mark">
                     <LinkIcon size={24} aria-hidden="true" />
                   </span>
-                  <h1>No video loaded</h1>
+                  <h1>{canControlRoom ? 'Choose the first video' : 'Waiting for the host'}</h1>
+                  <p>{canControlRoom ? 'Paste a YouTube link or search from the bar.' : ownerName ? `${ownerName} controls the room video.` : 'The host controls the room video.'}</p>
+                  <button className="empty-action" type="button" onClick={handleCopyLink}>
+                    {copied ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
+                    {copied ? 'Copied' : 'Invite'}
+                  </button>
                 </div>
               )}
               {currentVideo && !playerReady && (
@@ -1530,13 +1781,13 @@ function App() {
                       onPointerMove={handleGlassPointerMove}
                       onPointerLeave={handleGlassPointerLeave}
                       onClick={handleTogglePlayback}
-                      disabled={!playerReady}
-                      title={playerError ?? 'Play'}
-                      aria-label={playerError ?? 'Play video'}
+                      disabled={!playerReady && canControlRoom}
+                      title={playerError ?? playbackControlTitle}
+                      aria-label={playerError ?? playbackControlTitle}
                     >
-                      <Play size={28} fill="currentColor" aria-hidden="true" />
+                      {canControlRoom ? <Play size={28} fill="currentColor" aria-hidden="true" /> : <Lock size={25} aria-hidden="true" />}
                     </button>
-                    <span>{playerError ?? 'Ready'}</span>
+                    <span>{playerError ?? (canControlRoom ? 'Ready' : 'Host controlled')}</span>
                     {playerError && currentVideo && (
                       <a className="youtube-fallback-link" href={`https://www.youtube.com/watch?v=${currentVideo.id}`} target="_blank" rel="noreferrer">
                         Open on YouTube
@@ -1546,7 +1797,7 @@ function App() {
                 </div>
               )}
               {miniPlayerActive && currentVideo && (
-                <div className="mini-player-topbar" onPointerUp={(event) => event.stopPropagation()}>
+                <div className="mini-player-topbar" onPointerDown={handleMiniPlayerPointerDown} onPointerUp={(event) => event.stopPropagation()}>
                   <span className={`mini-player-status ${effectiveStatus === 'playing' ? 'is-playing' : 'is-paused'}`} aria-hidden="true" />
                   <span className="mini-player-copy">
                     <span className="mini-player-title">{currentVideo.title}</span>
@@ -1565,8 +1816,8 @@ function App() {
                 type="button"
                 onClick={handleTogglePlayback}
                 disabled={!currentVideo}
-                title={effectiveStatus === 'playing' ? 'Pause' : 'Play'}
-                aria-label={effectiveStatus === 'playing' ? 'Pause' : 'Play'}
+                title={playbackControlTitle}
+                aria-label={playbackControlTitle}
               >
                 {effectiveStatus === 'playing' ? <Pause className="transport-glyph is-pause" size={18} fill="currentColor" aria-hidden="true" /> : <Play className="transport-glyph is-play" size={18} fill="currentColor" aria-hidden="true" />}
               </button>
@@ -1576,11 +1827,11 @@ function App() {
                 className="timeline"
                 type="range"
                 min="0"
-                max={Math.max(1, Math.floor(duration || displayTime || 1))}
+                max={timelineMax}
                 step="0.1"
-                value={Math.min(displayTime, Math.max(1, duration || displayTime || 1))}
+                value={Math.min(displayTime, timelineMax)}
                 onChange={handleSeek}
-                disabled={!currentVideo}
+                disabled={!currentVideo || !canControlRoom}
                 aria-label="Video timeline"
               />
               <span className="time-code">{formatTime(duration)}</span>
@@ -1613,6 +1864,23 @@ function App() {
                 {connected ? <Wifi size={15} aria-hidden="true" /> : <WifiOff size={15} aria-hidden="true" />}
                 {connected ? `${latencyMs ?? 0} ms` : 'Offline'}
               </span>
+              {currentVideo && !canControlRoom && (
+                <span className="lock-pill" title={controlUnavailableMessage}>
+                  <Lock size={14} aria-hidden="true" />
+                  Host controls
+                </span>
+              )}
+              {currentVideo && (
+                <button
+                  className="icon-button control-icon"
+                  type="button"
+                  onClick={handleResync}
+                  title={controllerName ? `Sync to ${controllerName}` : 'Sync to room'}
+                  aria-label={controllerName ? `Sync to ${controllerName}` : 'Sync to room'}
+                >
+                  <RotateCcw size={16} aria-hidden="true" />
+                </button>
+              )}
               <button
                 className="icon-button control-icon"
                 type="button"
@@ -1648,31 +1916,50 @@ function App() {
                 const messageIsOwn = message.clientId === clientId
 
                 return (
-                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'}`} key={message.id} style={{ '--chat-color': message.color } as CSSProperties}>
+                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'} ${message.image ? 'has-image' : ''}`} key={message.id} style={{ '--chat-color': message.color } as CSSProperties}>
                     <span className="chat-author">
                       <span className="chat-author-dot" aria-hidden="true" />
                       <span>{messageIsOwn ? 'You' : message.name}</span>
                     </span>
-                    <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>
+                    {message.body && <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>}
+                    {message.image && (
+                      <button className="chat-image-button" type="button" onClick={() => setPreviewImage({ image: message.image as ChatImage, author: messageIsOwn ? 'You' : message.name })} aria-label="Open shared image">
+                        <img src={message.image.dataUrl} alt={message.image.name || 'Shared image'} />
+                      </button>
+                    )}
                     <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                   </article>
                 )
               })}
             </div>
 
-            <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
+            <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''} ${pendingImage ? 'has-attachment' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
+              {pendingImage && (
+                <div className="pending-attachment">
+                  <img src={pendingImage.dataUrl} alt={pendingImage.name || 'Image attachment'} />
+                  <span>{pendingImage.name || 'Image'}</span>
+                  <button className="pending-remove" type="button" onClick={() => setPendingImage(null)} title="Remove image" aria-label="Remove image">
+                    <X size={14} aria-hidden="true" />
+                  </button>
+                </div>
+              )}
               <MessageCircle size={18} aria-hidden="true" />
               <input
                 ref={chatInputRef}
                 value={chatDraft}
                 onChange={(event) => setChatDraft(event.currentTarget.value)}
                 onKeyDown={handleChatInputKeyDown}
-                placeholder="Message the room"
+                onPaste={handleChatPaste}
+                placeholder={pendingImage ? 'Add a caption' : 'Message the room'}
                 aria-label="Message the room"
                 enterKeyHint="send"
                 autoCapitalize="sentences"
                 maxLength={400}
               />
+              <input ref={imageInputRef} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={handleImageFileChange} />
+              <button className="icon-button attachment-button" type="button" onClick={handleOpenImagePicker} disabled={uploadingImage} title="Attach image" aria-label="Attach image">
+                {uploadingImage ? <LoaderCircle size={17} className="spin" aria-hidden="true" /> : <ImageIcon size={17} aria-hidden="true" />}
+              </button>
               {emojiSuggestions.length > 0 && (
                 <div className="emoji-suggestions" role="listbox" aria-label="Emoji suggestions">
                   {emojiSuggestions.map((option) => (
@@ -1691,10 +1978,24 @@ function App() {
                   ))}
                 </div>
               )}
-              <button className="icon-button send-button" type="submit" title="Send" aria-label="Send message">
+              <button className="icon-button send-button" type="submit" disabled={uploadingImage} title="Send" aria-label="Send message">
                 <Send size={17} aria-hidden="true" />
               </button>
             </form>
+
+            {previewImage && (
+              <div className="image-lightbox" role="dialog" aria-modal="true" aria-label="Shared image preview" onClick={() => setPreviewImage(null)}>
+                <div className="image-lightbox-content" onClick={(event) => event.stopPropagation()}>
+                  <div className="image-lightbox-topbar">
+                    <span>{previewImage.author}</span>
+                    <button className="icon-button" type="button" onClick={() => setPreviewImage(null)} title="Close" aria-label="Close image preview">
+                      <X size={18} aria-hidden="true" />
+                    </button>
+                  </div>
+                  <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="now-row">
@@ -1705,9 +2006,19 @@ function App() {
             </div>
             <div className="member-strip" aria-label="Room members">
               {roomState?.members.map((member) => (
-                <span className="member-avatar" key={member.clientId} style={{ '--member-color': member.color } as CSSProperties} title={member.name}>
-                  {member.name.slice(0, 1).toUpperCase()}
-                </span>
+                <button
+                  className={`member-avatar ${member.trusted ? 'is-trusted' : ''} ${member.clientId === roomState.ownerId ? 'is-owner' : ''} ${isOwner && member.clientId !== clientId ? 'can-toggle' : ''}`}
+                  key={member.clientId}
+                  type="button"
+                  style={{ '--member-color': member.color } as CSSProperties}
+                  onClick={() => handleToggleTrusted(member)}
+                  disabled={!isOwner || member.clientId === clientId}
+                  title={getMemberTitle(member, roomState.ownerId, isOwner && member.clientId !== clientId)}
+                  aria-label={getMemberTitle(member, roomState.ownerId, isOwner && member.clientId !== clientId)}
+                >
+                  <span className="member-initial">{member.name.slice(0, 1).toUpperCase()}</span>
+                  {member.clientId === roomState.ownerId ? <Crown className="member-role-icon" size={11} aria-hidden="true" /> : member.trusted ? <ShieldCheck className="member-role-icon" size={11} aria-hidden="true" /> : null}
+                </button>
               ))}
             </div>
           </div>
@@ -1895,6 +2206,22 @@ function safeDuration(player: YouTubePlayer | null) {
   return Number.isFinite(playerDuration) && playerDuration > 0 ? playerDuration : 0
 }
 
+function setPlaybackRate(player: YouTubePlayer | null, rate: number) {
+  if (!isUsableYouTubePlayer(player) || typeof player.setPlaybackRate !== 'function') {
+    return
+  }
+
+  try {
+    const currentRate = typeof player.getPlaybackRate === 'function' ? player.getPlaybackRate() : 1
+
+    if (Math.abs(currentRate - rate) > 0.01) {
+      player.setPlaybackRate(rate)
+    }
+  } catch {
+    return
+  }
+}
+
 function clampPlaybackTime(seconds: number, video?: VideoMeta | null, player?: YouTubePlayer | null) {
   const safeSeconds = Number.isFinite(seconds) ? Math.max(0, seconds) : 0
   const durationSeconds = safeDuration(player ?? null) || parseDurationSeconds(video?.duration)
@@ -2000,6 +2327,115 @@ async function fetchOembedVideoMeta(videoId: string): Promise<VideoMeta> {
   }
 
   throw new Error(payload.message ?? 'This YouTube video cannot be loaded.')
+}
+
+function findClipboardImageFile(data: DataTransfer) {
+  const files = Array.from(data.files)
+  const directFile = files.find((file) => file.type.startsWith('image/'))
+
+  if (directFile) {
+    return directFile
+  }
+
+  return Array.from(data.items)
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .find((file): file is File => Boolean(file)) ?? null
+}
+
+async function prepareChatImage(file: File): Promise<ChatImage> {
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Attach an image file.')
+  }
+
+  if (file.size > CHAT_IMAGE_MAX_SOURCE_BYTES) {
+    throw new Error('That image is too large to share here.')
+  }
+
+  const image = await loadImageFromFile(file)
+  const scale = Math.min(1, CHAT_IMAGE_MAX_DIMENSION / Math.max(image.naturalWidth, image.naturalHeight))
+  const width = Math.max(1, Math.round(image.naturalWidth * scale))
+  const height = Math.max(1, Math.round(image.naturalHeight * scale))
+  const canvas = document.createElement('canvas')
+  const context = canvas.getContext('2d')
+
+  if (!context) {
+    throw new Error('Unable to process this image.')
+  }
+
+  canvas.width = width
+  canvas.height = height
+  context.fillStyle = '#050609'
+  context.fillRect(0, 0, width, height)
+  context.drawImage(image, 0, 0, width, height)
+
+  for (const quality of CHAT_IMAGE_QUALITY_STEPS) {
+    const blob = await canvasToBlob(canvas, 'image/jpeg', quality)
+    const dataUrl = await blobToDataUrl(blob)
+    const size = estimateDataUrlBytes(dataUrl)
+
+    if (size <= CHAT_IMAGE_MAX_BYTES) {
+      return {
+        dataUrl,
+        mimeType: 'image/jpeg',
+        name: sanitizeImageName(file.name),
+        width,
+        height,
+        size,
+      }
+    }
+  }
+
+  throw new Error('That image is too detailed to share here.')
+}
+
+function loadImageFromFile(file: File) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('Unable to read this image.'))
+    }
+    image.src = url
+  })
+}
+
+function canvasToBlob(canvas: HTMLCanvasElement, type: string, quality: number) {
+  return new Promise<Blob>((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) {
+        resolve(blob)
+        return
+      }
+
+      reject(new Error('Unable to compress this image.'))
+    }, type, quality)
+  })
+}
+
+function blobToDataUrl(blob: Blob) {
+  return new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(new Error('Unable to encode this image.'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+function estimateDataUrlBytes(dataUrl: string) {
+  const payload = dataUrl.split(',')[1] ?? ''
+  return Math.floor((payload.length * 3) / 4)
+}
+
+function sanitizeImageName(value: string) {
+  return value.replace(/[^\w .()-]/g, '').trim().slice(0, 80)
 }
 
 function configureYouTubeIframe(player: YouTubePlayer) {
@@ -2146,6 +2582,35 @@ function formatTime(seconds: number) {
 
 function formatMessageTime(timestamp: number) {
   return messageTimeFormatter.format(new Date(timestamp))
+}
+
+function getControlUnavailableMessage(state: RoomState | null) {
+  const ownerName = state?.ownerName?.trim()
+  return ownerName ? `Only ${ownerName} and trusted viewers can control playback.` : 'Only the host and trusted viewers can control playback.'
+}
+
+function canControlPlaybackState(state: RoomState, clientId: string) {
+  if (state.ownerId === clientId) {
+    return true
+  }
+
+  return Boolean(state.members.find((member) => member.clientId === clientId)?.trusted)
+}
+
+function getMemberTitle(member: RoomMember, ownerId: string, canToggle: boolean) {
+  if (member.clientId === ownerId) {
+    return `${member.name} · Owner`
+  }
+
+  if (member.trusted) {
+    return canToggle ? `${member.name} · Trusted · Click to remove control` : `${member.name} · Trusted`
+  }
+
+  return canToggle ? `${member.name} · Click to trust for controls` : member.name
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, Number.isFinite(value) ? value : min))
 }
 
 export default App

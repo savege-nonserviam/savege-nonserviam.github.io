@@ -32,18 +32,20 @@
   box-sizing: border-box;
   -webkit-tap-highlight-color: transparent;
   -webkit-touch-callout: none;
-  user-select: none;
 }
 
 *::selection {
-  color: inherit;
-  background: transparent;
+  color: #ffffff;
+  background: rgba(89, 214, 189, 0.34);
 }
 
-*:focus,
-*:focus-visible,
-*:focus-within {
+*:focus {
   outline: none;
+}
+
+*:focus-visible {
+  outline: 2px solid rgba(137, 255, 228, 0.82);
+  outline-offset: 3px;
 }
 
 html {
