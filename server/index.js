@@ -23,6 +23,14 @@ const MAX_CHAT_BODY_LENGTH = 400
 const MAX_CHAT_IMAGE_BYTES = 700 * 1024
 const MAX_CHAT_IMAGE_DIMENSION = 1600
 const MAX_SOCKET_PAYLOAD_BYTES = 1_200_000
+const STORYBOARD_CACHE_TTL_MS = 6 * 60 * 60 * 1000
+const PRESENCE_UPDATE_MIN_INTERVAL_MS = 50
+const PRESENCE_ROOM_BOUNDS = {
+  minX: -5.4,
+  maxX: 5.4,
+  minZ: -3.8,
+  maxZ: 4.2,
+}
 const MEMBER_COLORS = ['#ff5c66', '#f2bf5b', '#5ee0c6', '#69a7ff', '#b99cff', '#ff8abf', '#a5dc6d', '#7dd3fc']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
 const EMOJI_SHORTCODES = new Map([
@@ -130,6 +138,7 @@ const io = new Server(httpServer, {
 })
 
 const rooms = new Map()
+const storyboardCache = new Map()
 
 app.disable('x-powered-by')
 app.use((request, response, next) => {
@@ -231,6 +240,22 @@ app.get('/api/youtube/video', async (request, response) => {
   } catch (error) {
     console.error('YouTube video lookup error:', error)
     response.status(502).json({ message: 'Unable to verify this YouTube video.' })
+  }
+})
+
+app.get('/api/youtube/storyboard', async (request, response) => {
+  const videoId = validateYouTubeId(String(request.query.videoId ?? ''))
+
+  if (!videoId) {
+    response.status(400).json({ message: 'A valid YouTube video id is required.' })
+    return
+  }
+
+  try {
+    response.json({ storyboard: await fetchVideoStoryboard(videoId) })
+  } catch (error) {
+    console.error('YouTube storyboard lookup error:', error)
+    response.json({ storyboard: { videoId, levels: [] } })
   }
 })
 
@@ -349,12 +374,15 @@ io.on('connection', (socket) => {
       trusted: false,
       socketId: socket.id,
       lastSeen: Date.now(),
+      lastPresenceAt: 0,
+      presence: createDefaultPresence(clientId, room),
     }
 
     member.name = name
     member.connected = true
     member.socketId = socket.id
     member.lastSeen = Date.now()
+    member.presence = normalizePresence(member.presence, createDefaultPresence(clientId, room), Date.now())
     room.members.set(clientId, member)
 
     if (!room.ownerId) {
@@ -427,6 +455,29 @@ io.on('connection', (socket) => {
     const state = serializeRoom(room)
     reply?.({ ok: true, state })
     io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('member:presence', (payload) => {
+    const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
+
+    if (!room || !member?.connected) {
+      return
+    }
+
+    const now = Date.now()
+
+    if (member.lastPresenceAt && now - member.lastPresenceAt < PRESENCE_UPDATE_MIN_INTERVAL_MS) {
+      return
+    }
+
+    member.lastPresenceAt = now
+    member.presence = normalizePresence(payload, member.presence, now)
+
+    io.to(room.id).emit('member:presence', {
+      clientId: member.clientId,
+      presence: member.presence,
+    })
   })
 
   socket.on('owner:setTrusted', (payload, reply) => {
@@ -629,6 +680,171 @@ function videoFromDetails(videoId, details) {
   }
 }
 
+async function fetchVideoStoryboard(videoId) {
+  const cached = storyboardCache.get(videoId)
+
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.storyboard
+  }
+
+  const watchUrl = new URL('https://www.youtube.com/watch')
+  watchUrl.searchParams.set('v', videoId)
+  watchUrl.searchParams.set('bpctr', '9999999999')
+  watchUrl.searchParams.set('has_verified', '1')
+
+  const watchResponse = await fetch(watchUrl, {
+    headers: {
+      'accept-language': 'en-US,en;q=0.9',
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+    },
+  })
+
+  if (!watchResponse.ok) {
+    throw new Error(`YouTube watch page failed with ${watchResponse.status}`)
+  }
+
+  const html = await watchResponse.text()
+  const playerResponse = extractInitialPlayerResponse(html)
+  const spec = playerResponse?.storyboards?.playerStoryboardSpecRenderer?.spec
+  const levels = parseStoryboardSpec(videoId, spec)
+  const storyboard = {
+    videoId,
+    levels,
+  }
+
+  if (levels.length > 0) {
+    storyboardCache.set(videoId, {
+      expiresAt: Date.now() + STORYBOARD_CACHE_TTL_MS,
+      storyboard,
+    })
+  }
+
+  return storyboard
+}
+
+function extractInitialPlayerResponse(html) {
+  const markerIndex = html.indexOf('ytInitialPlayerResponse')
+
+  if (markerIndex < 0) {
+    return null
+  }
+
+  const objectStart = html.indexOf('{', markerIndex)
+  const objectText = extractJsonObject(html, objectStart)
+
+  if (!objectText) {
+    return null
+  }
+
+  try {
+    return JSON.parse(objectText)
+  } catch {
+    return null
+  }
+}
+
+function extractJsonObject(text, startIndex) {
+  if (startIndex < 0 || text[startIndex] !== '{') {
+    return ''
+  }
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = startIndex; index < text.length; index += 1) {
+    const character = text[index]
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (character === '\\') {
+        escaped = true
+      } else if (character === '"') {
+        inString = false
+      }
+
+      continue
+    }
+
+    if (character === '"') {
+      inString = true
+      continue
+    }
+
+    if (character === '{') {
+      depth += 1
+    } else if (character === '}') {
+      depth -= 1
+
+      if (depth === 0) {
+        return text.slice(startIndex, index + 1)
+      }
+    }
+  }
+
+  return ''
+}
+
+function parseStoryboardSpec(videoId, spec) {
+  if (typeof spec !== 'string' || !spec.includes('|')) {
+    return []
+  }
+
+  const [urlTemplate, ...levelSpecs] = spec.split('|')
+
+  return levelSpecs
+    .map((levelSpec, index) => parseStoryboardLevel(videoId, urlTemplate, levelSpec, index))
+    .filter(Boolean)
+    .sort((leftLevel, rightLevel) => leftLevel.width - rightLevel.width)
+}
+
+function parseStoryboardLevel(videoId, rawUrlTemplate, levelSpec, levelIndex) {
+  const parts = String(levelSpec ?? '').split('#')
+  const width = Number(parts[0])
+  const height = Number(parts[1])
+  const count = Number(parts[2])
+  const columns = Number(parts[3])
+  const rows = Number(parts[4])
+  const intervalMs = Number(parts[5])
+  const nameTemplate = parts[6] || 'default'
+  const signature = parts[7] || ''
+
+  if (![width, height, count, columns, rows, intervalMs].every(Number.isFinite) || width <= 0 || height <= 0 || count <= 0 || columns <= 0 || rows <= 0 || intervalMs <= 0) {
+    return null
+  }
+
+  if (!rawUrlTemplate.includes('/sb/') || !rawUrlTemplate.includes(videoId)) {
+    return null
+  }
+
+  const sheetNameTemplate = nameTemplate.replace(/\$M/g, '{storyboard}')
+  const levelUrl = rawUrlTemplate.replace(/\$L/g, String(levelIndex)).replace(/\$N/g, sheetNameTemplate)
+
+  return {
+    level: levelIndex,
+    width,
+    height,
+    count,
+    columns,
+    rows,
+    intervalMs,
+    urlTemplate: addStoryboardSignature(levelUrl, signature),
+  }
+}
+
+function addStoryboardSignature(url, signature) {
+  if (!signature) {
+    return url
+  }
+
+  if (url.includes('$M')) {
+    return url.replace(/\$M/g, signature)
+  }
+
+  return `${url}${url.includes('?') ? '&' : '?'}sigh=${encodeURIComponent(signature)}`
+}
+
 function getOrCreateRoom(roomId) {
   const existingRoom = rooms.get(roomId)
 
@@ -793,6 +1009,7 @@ function serializeRoom(room) {
       color: member.color,
       connected: member.connected,
       trusted: Boolean(member.trusted),
+      presence: normalizePresence(member.presence, createDefaultPresence(member.clientId, room), serverTime),
     })),
     video: room.video,
     playback: {
@@ -973,6 +1190,46 @@ function normalizeChatImage(value) {
   }
 }
 
+function createDefaultPresence(clientId, room) {
+  const spawnIndex = Math.max(0, connectedMembers(room).length)
+  const spawnPoints = [
+    { x: -1.8, z: 2.2, rotation: 0.28 },
+    { x: 1.8, z: 2.2, rotation: -0.28 },
+    { x: -3.2, z: 0.8, rotation: 0.72 },
+    { x: 3.2, z: 0.8, rotation: -0.72 },
+    { x: -0.8, z: 3.4, rotation: 0 },
+    { x: 0.8, z: 3.4, rotation: 0 },
+  ]
+  const basePresence = spawnPoints[spawnIndex % spawnPoints.length]
+  const offset = Math.floor(spawnIndex / spawnPoints.length) * 0.42
+
+  return normalizePresence(
+    {
+      ...basePresence,
+      x: basePresence.x + ((hashClientId(clientId) % 3) - 1) * 0.18,
+      z: basePresence.z - offset,
+      moving: false,
+    },
+    null,
+    Date.now(),
+  )
+}
+
+function normalizePresence(value, fallback = null, now = Date.now()) {
+  const fallbackPresence = fallback ?? { x: 0, z: 2.2, rotation: 0, moving: false }
+  const x = clampNumber(Number(value?.x), PRESENCE_ROOM_BOUNDS.minX, PRESENCE_ROOM_BOUNDS.maxX, fallbackPresence.x)
+  const z = clampNumber(Number(value?.z), PRESENCE_ROOM_BOUNDS.minZ, PRESENCE_ROOM_BOUNDS.maxZ, fallbackPresence.z)
+  const rotation = normalizeRotation(Number(value?.rotation), fallbackPresence.rotation)
+
+  return {
+    x,
+    z,
+    rotation,
+    moving: value?.moving === true,
+    updatedAt: now,
+  }
+}
+
 function replaceEmojiShortcodes(value) {
   return value
     .replace(/:([a-z0-9_+-]{1,32}):/gi, (match, shortcode) => findClosestEmoji(shortcode) || match)
@@ -1082,6 +1339,23 @@ function parseFormattedDurationSeconds(duration) {
 function normalizeSeconds(value, fallback = 0) {
   const seconds = Number(value)
   return Number.isFinite(seconds) && seconds >= 0 ? seconds : fallback
+}
+
+function normalizeRotation(value, fallback = 0) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+
+  const fullTurn = Math.PI * 2
+  return ((((value + Math.PI) % fullTurn) + fullTurn) % fullTurn) - Math.PI
+}
+
+function clampNumber(value, min, max, fallback = min) {
+  if (!Number.isFinite(value)) {
+    return fallback
+  }
+
+  return Math.min(max, Math.max(min, value))
 }
 
 function cleanText(value, maxLength) {

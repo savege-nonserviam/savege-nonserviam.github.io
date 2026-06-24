@@ -127,6 +127,36 @@ type EmojiOption = {
   keywords?: string[]
 }
 
+type TimelinePreviewState = {
+  active: boolean
+  percent: number
+  time: number
+}
+
+type StoryboardLevel = {
+  level: number
+  width: number
+  height: number
+  count: number
+  columns: number
+  rows: number
+  intervalMs: number
+  urlTemplate: string
+}
+
+type VideoStoryboard = {
+  videoId: string
+  levels: StoryboardLevel[]
+}
+
+type StoryboardFrame = {
+  imageUrl: string
+  column: number
+  columns: number
+  row: number
+  rows: number
+}
+
 type YouTubePlayer = {
   loadVideoById: (options: { videoId: string; startSeconds?: number }) => void
   cueVideoById: (options: { videoId: string; startSeconds?: number }) => void
@@ -221,6 +251,7 @@ const PLAYBACK_END_BUFFER_SECONDS = 0.75
 const STALE_PLAYBACK_RESET_GRACE_SECONDS = 30
 const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
+  hourCycle: 'h23',
   minute: '2-digit',
 })
 const EMOJI_OPTIONS: EmojiOption[] = [
@@ -430,6 +461,8 @@ function App() {
   const [scrollState, setScrollState] = useState<ScrollState>('top')
   const [scrollDirection, setScrollDirection] = useState<ScrollDirection>('idle')
   const [fullscreenIdle, setFullscreenIdle] = useState(false)
+  const [timelinePreview, setTimelinePreview] = useState<TimelinePreviewState>({ active: false, percent: 0, time: 0 })
+  const [videoStoryboard, setVideoStoryboard] = useState<VideoStoryboard | null>(null)
 
   const roomStateRef = useRef<RoomState | null>(null)
   const displayNameRef = useRef(displayName)
@@ -444,6 +477,7 @@ function App() {
   const lastAudibleVolumeRef = useRef(DEFAULT_VOLUME)
   const videoTapRef = useRef<{ timerId: number; time: number; x: number; y: number } | null>(null)
   const videoShellRef = useRef<HTMLDivElement | null>(null)
+  const timelineRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
   const chatInputRef = useRef<HTMLInputElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
@@ -471,6 +505,28 @@ function App() {
   const roleLabel = isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted' : 'Guest'
   const controllerName = roomState?.controllerName || ownerName
   const timelineMax = Math.max(1, Math.floor(duration || displayTime || parseDurationSeconds(currentVideo?.duration) || 1))
+  const timelineProgress = currentVideo ? clampNumber((Math.min(displayTime, timelineMax) / timelineMax) * 100, 0, 100) : 0
+  const activeVideoStoryboard = videoStoryboard?.videoId === currentVideo?.id ? videoStoryboard : null
+  const timelineStoryboardFrame = useMemo(() => getStoryboardFrame(activeVideoStoryboard, timelinePreview.time), [activeVideoStoryboard, timelinePreview.time])
+  const timelineStoryboardStyle = useMemo(
+    () =>
+      timelineStoryboardFrame
+        ? ({
+            backgroundImage: `url("${timelineStoryboardFrame.imageUrl}")`,
+            backgroundPosition: `${getStoryboardPositionPercent(timelineStoryboardFrame.column, timelineStoryboardFrame.columns)}% ${getStoryboardPositionPercent(timelineStoryboardFrame.row, timelineStoryboardFrame.rows)}%`,
+            backgroundSize: `${timelineStoryboardFrame.columns * 100}% ${timelineStoryboardFrame.rows * 100}%`,
+          }) as CSSProperties
+        : undefined,
+    [timelineStoryboardFrame],
+  )
+  const timelineStyle = useMemo(
+    () =>
+      ({
+        '--timeline-progress': `${timelineProgress}%`,
+        '--timeline-preview': `${timelinePreview.percent}%`,
+      }) as CSSProperties,
+    [timelinePreview.percent, timelineProgress],
+  )
   const showSearchPanel = searchOpen && (searchResults.length > 0 || Boolean(searchError) || searching || searchAttempted)
   const miniPlayerStyle = useMemo(
     () =>
@@ -486,6 +542,7 @@ function App() {
   const scrollDepthTarget = scrollState === 'compressed' ? 1 : scrollState === 'scrolled' ? 0.48 : 0
   const focusDepthTarget = searchOpen || chatOpen || nameDialogOpen || playerError ? 1 : 0
   const chromeState = isFullscreen && fullscreenIdle && !chatOpen ? 'minimal' : searchOpen || chatOpen ? 'active' : scrollState === 'compressed' ? 'compact' : 'expanded'
+  const viewMode = isFullscreen ? 'fullscreen' : 'classic'
   const materialDepth = useSpringValue(materialWeightTarget)
   const scrollDepth = useSpringValue(scrollDepthTarget)
   const focusDepth = useSpringValue(focusDepthTarget)
@@ -1085,6 +1142,32 @@ function App() {
   }, [currentVideo?.thumbnail])
 
   useEffect(() => {
+    let cancelled = false
+
+    if (!currentVideo?.id) {
+      return
+    }
+
+    const videoId = currentVideo.id
+
+    fetchVideoStoryboard(videoId)
+      .then((storyboard) => {
+        if (!cancelled && storyboard.videoId === videoId) {
+          setVideoStoryboard(storyboard)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setVideoStoryboard({ videoId, levels: [] })
+        }
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [currentVideo?.id])
+
+  useEffect(() => {
     let lastScrollY = window.scrollY
     let idleTimer = 0
     let animationFrame = 0
@@ -1361,12 +1444,14 @@ function App() {
   }
 
   const handleVideoSurfacePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!currentVideo) {
+    if (event.target instanceof Element && event.target.closest('button, a, input, .mini-player-topbar')) {
       return
     }
 
-    if (event.target instanceof Element && event.target.closest('.player-overlay-content, .mini-player-topbar')) {
-      return
+    if (!isFullscreen && !miniPlayerOpen) {
+      if (!currentVideo) {
+        return
+      }
     }
 
     if (event.pointerType === 'mouse') {
@@ -1386,7 +1471,7 @@ function App() {
       return
     }
 
-    const now = Date.now()
+    const now = event.timeStamp
     const previousTap = videoTapRef.current
     const distance = previousTap ? Math.hypot(event.clientX - previousTap.x, event.clientY - previousTap.y) : Number.POSITIVE_INFINITY
     const isDoubleTap = previousTap && now - previousTap.time <= MOBILE_DOUBLE_TAP_MS && distance <= MOBILE_DOUBLE_TAP_DISTANCE_PX
@@ -1420,6 +1505,54 @@ function App() {
     openChatInput()
   }
 
+  const readTimelinePreviewAt = (clientX: number) => {
+    if (!currentVideo) {
+      return null
+    }
+
+    const rect = timelineRef.current?.getBoundingClientRect()
+
+    if (!rect || rect.width <= 0) {
+      return null
+    }
+
+    const percent = clampNumber(((clientX - rect.left) / rect.width) * 100, 0, 100)
+    const time = clampNumber((percent / 100) * timelineMax, 0, timelineMax)
+
+    return { percent, time }
+  }
+
+  const handleTimelinePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const preview = readTimelinePreviewAt(event.clientX)
+
+    if (!preview) {
+      return
+    }
+
+    setTimelinePreview({ ...preview, active: true })
+  }
+
+  const handleTimelinePointerLeave = () => {
+    setTimelinePreview((currentPreview) => ({ ...currentPreview, active: false }))
+  }
+
+  const handleTimelineFocus = () => {
+    if (!currentVideo) {
+      return
+    }
+
+    const time = Math.min(displayTime, timelineMax)
+    setTimelinePreview({
+      active: true,
+      percent: clampNumber((time / timelineMax) * 100, 0, 100),
+      time,
+    })
+  }
+
+  const handleTimelineBlur = () => {
+    setTimelinePreview((currentPreview) => ({ ...currentPreview, active: false }))
+  }
+
   const handleSeek = (event: ChangeEvent<HTMLInputElement>) => {
     if (!currentVideo) {
       return
@@ -1432,11 +1565,13 @@ function App() {
 
     const player = playerRef.current
     const nextTime = clampPlaybackTime(Number(event.currentTarget.value), currentVideo, isUsableYouTubePlayer(player) ? player : null)
+    const nextPercent = clampNumber((nextTime / timelineMax) * 100, 0, 100)
 
     if (isUsableYouTubePlayer(player)) {
       player.seekTo(nextTime, true)
     }
     setDisplayTime(nextTime)
+    setTimelinePreview({ active: true, percent: nextPercent, time: nextTime })
     socket.emit('owner:seek', { currentTime: nextTime, serverTime: serverNow() })
   }
 
@@ -1655,6 +1790,7 @@ function App() {
       data-motion={contentIsMoving ? 'moving' : 'still'}
       data-scroll={scrollState}
       data-scroll-direction={scrollDirection}
+      data-view={viewMode}
       style={materialStyle}
     >
       {currentVideo?.thumbnail && (
@@ -1823,18 +1959,37 @@ function App() {
               </button>
 
               <span className="time-code">{formatTime(displayTime)}</span>
-              <input
-                className="timeline"
-                type="range"
-                min="0"
-                max={timelineMax}
-                step="0.1"
-                value={Math.min(displayTime, timelineMax)}
-                onChange={handleSeek}
-                disabled={!currentVideo || !canControlRoom}
-                aria-label="Video timeline"
-              />
-              <span className="time-code">{formatTime(duration)}</span>
+              <div
+                className={`timeline-wrap ${timelinePreview.active && currentVideo ? 'is-previewing' : ''}`}
+                ref={timelineRef}
+                style={timelineStyle}
+                onPointerEnter={handleTimelinePointerMove}
+                onPointerMove={handleTimelinePointerMove}
+                onPointerLeave={handleTimelinePointerLeave}
+              >
+                <div className="timeline-preview" aria-hidden="true">
+                  <div className={`timeline-preview-frame ${timelineStoryboardFrame ? 'has-storyboard' : ''}`}>
+                    {timelineStoryboardFrame ? <span className="timeline-storyboard-frame" style={timelineStoryboardStyle} /> : currentVideo && <img src={currentVideo.thumbnail} alt="" />}
+                    <span className="timeline-preview-shade" />
+                    <span className="timeline-preview-time">{formatTime(timelinePreview.time)}</span>
+                  </div>
+                </div>
+                <input
+                  className="timeline"
+                  type="range"
+                  min="0"
+                  max={timelineMax}
+                  step="0.1"
+                  value={Math.min(displayTime, timelineMax)}
+                  onChange={handleSeek}
+                  onFocus={handleTimelineFocus}
+                  onBlur={handleTimelineBlur}
+                  disabled={!currentVideo || !canControlRoom}
+                  aria-label="Video timeline"
+                  aria-valuetext={`${formatTime(displayTime)} of ${formatTime(timelineMax)}`}
+                />
+              </div>
+              <span className="time-code">{formatTime(timelineMax)}</span>
 
               <div className="volume-control" style={{ '--volume-level': `${audibleVolume}%` } as CSSProperties}>
                 <button
@@ -1914,20 +2069,21 @@ function App() {
             <div className="chat-feed" aria-live="polite">
               {recentMessages.map((message) => {
                 const messageIsOwn = message.clientId === clientId
+                const messageBody = message.body ? resolveEmojiShortcodes(message.body) : ''
+                const messageIsLong = isLongChatBody(messageBody)
 
                 return (
-                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'} ${message.image ? 'has-image' : ''}`} key={message.id} style={{ '--chat-color': message.color } as CSSProperties}>
-                    <span className="chat-author">
-                      <span className="chat-author-dot" aria-hidden="true" />
-                      <span>{messageIsOwn ? 'You' : message.name}</span>
+                  <article className={`chat-message ${messageIsOwn ? 'is-own' : 'is-other'} ${message.image ? 'has-image' : ''} ${messageIsLong ? 'is-long' : ''}`} key={message.id} style={{ '--chat-color': message.color } as CSSProperties}>
+                    {messageBody && <span className="chat-body">{messageBody}</span>}
+                    <span className="chat-meta">
+                      <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
+                      <span className="chat-author">{messageIsOwn ? 'You' : message.name}</span>
                     </span>
-                    {message.body && <span className="chat-body">{resolveEmojiShortcodes(message.body)}</span>}
                     {message.image && (
                       <button className="chat-image-button" type="button" onClick={() => setPreviewImage({ image: message.image as ChatImage, author: messageIsOwn ? 'You' : message.name })} aria-label="Open shared image">
                         <img src={message.image.dataUrl} alt={message.image.name || 'Shared image'} />
                       </button>
                     )}
-                    <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                   </article>
                 )
               })}
@@ -1983,19 +2139,6 @@ function App() {
               </button>
             </form>
 
-            {previewImage && (
-              <div className="image-lightbox" role="dialog" aria-modal="true" aria-label="Shared image preview" onClick={() => setPreviewImage(null)}>
-                <div className="image-lightbox-content" onClick={(event) => event.stopPropagation()}>
-                  <div className="image-lightbox-topbar">
-                    <span>{previewImage.author}</span>
-                    <button className="icon-button" type="button" onClick={() => setPreviewImage(null)} title="Close" aria-label="Close image preview">
-                      <X size={18} aria-hidden="true" />
-                    </button>
-                  </div>
-                  <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="now-row">
@@ -2024,6 +2167,25 @@ function App() {
           </div>
         </section>
       </main>
+
+      {previewImage && (
+        <div
+          className="image-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Shared image preview"
+          onPointerDown={(event) => event.stopPropagation()}
+          onPointerUp={(event) => event.stopPropagation()}
+          onClick={(event) => {
+            event.stopPropagation()
+            setPreviewImage(null)
+          }}
+        >
+          <div className="image-lightbox-content" onPointerDown={(event) => event.stopPropagation()} onPointerUp={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+            <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
+          </div>
+        </div>
+      )}
 
       {nameDialogOpen && (
         <div className="name-gate" role="dialog" aria-modal="true" aria-labelledby="name-gate-title">
@@ -2329,6 +2491,84 @@ async function fetchOembedVideoMeta(videoId: string): Promise<VideoMeta> {
   throw new Error(payload.message ?? 'This YouTube video cannot be loaded.')
 }
 
+async function fetchVideoStoryboard(videoId: string): Promise<VideoStoryboard> {
+  const response = await fetch(apiUrl(`/api/youtube/storyboard?videoId=${encodeURIComponent(videoId)}`))
+  const payload = (await response.json()) as { storyboard?: VideoStoryboard }
+
+  if (!response.ok || !payload.storyboard || payload.storyboard.videoId !== videoId) {
+    return { videoId, levels: [] }
+  }
+
+  return {
+    videoId,
+    levels: Array.isArray(payload.storyboard.levels) ? payload.storyboard.levels.filter(isStoryboardLevel) : [],
+  }
+}
+
+function isStoryboardLevel(value: unknown): value is StoryboardLevel {
+  const level = value as StoryboardLevel
+
+  return (
+    Boolean(level) &&
+    Number.isFinite(level.level) &&
+    Number.isFinite(level.width) &&
+    Number.isFinite(level.height) &&
+    Number.isFinite(level.count) &&
+    Number.isFinite(level.columns) &&
+    Number.isFinite(level.rows) &&
+    Number.isFinite(level.intervalMs) &&
+    level.width > 0 &&
+    level.height > 0 &&
+    level.count > 0 &&
+    level.columns > 0 &&
+    level.rows > 0 &&
+    level.intervalMs > 0 &&
+    typeof level.urlTemplate === 'string' &&
+    level.urlTemplate.includes('{storyboard}')
+  )
+}
+
+function getStoryboardFrame(storyboard: VideoStoryboard | null, seconds: number): StoryboardFrame | null {
+  const level = getBestStoryboardLevel(storyboard)
+
+  if (!level) {
+    return null
+  }
+
+  const frameIndex = Math.min(level.count - 1, Math.max(0, Math.floor((Math.max(0, seconds) * 1000) / level.intervalMs)))
+  const framesPerSheet = Math.max(1, level.columns * level.rows)
+  const sheetIndex = Math.floor(frameIndex / framesPerSheet)
+  const sheetFrameIndex = frameIndex % framesPerSheet
+
+  return {
+    imageUrl: level.urlTemplate.replace('{storyboard}', String(sheetIndex)),
+    column: sheetFrameIndex % level.columns,
+    columns: level.columns,
+    row: Math.floor(sheetFrameIndex / level.columns),
+    rows: level.rows,
+  }
+}
+
+function getBestStoryboardLevel(storyboard: VideoStoryboard | null) {
+  if (!storyboard?.levels.length) {
+    return null
+  }
+
+  return (
+    storyboard.levels
+      .slice()
+      .sort((leftLevel, rightLevel) => {
+        const leftDistance = Math.abs(leftLevel.width - 320)
+        const rightDistance = Math.abs(rightLevel.width - 320)
+        return leftDistance - rightDistance || rightLevel.width - leftLevel.width
+      })[0] ?? null
+  )
+}
+
+function getStoryboardPositionPercent(index: number, total: number) {
+  return total <= 1 ? 0 : (index / (total - 1)) * 100
+}
+
 function findClipboardImageFile(data: DataTransfer) {
   const files = Array.from(data.files)
   const directFile = files.find((file) => file.type.startsWith('image/'))
@@ -2582,6 +2822,11 @@ function formatTime(seconds: number) {
 
 function formatMessageTime(timestamp: number) {
   return messageTimeFormatter.format(new Date(timestamp))
+}
+
+function isLongChatBody(value: string) {
+  const body = value.trim()
+  return body.length > 52 || /\S{24,}/.test(body) || body.includes('\n')
 }
 
 function getControlUnavailableMessage(state: RoomState | null) {
