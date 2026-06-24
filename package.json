@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "scripts": {
     "dev": "concurrently -k -n server,web -c red,cyan \"node server/index.js\" \"vite --host 0.0.0.0\"",

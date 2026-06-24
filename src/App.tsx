@@ -9,7 +9,10 @@ import {
   type ClipboardEvent as ReactClipboardEvent,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
+  type SyntheticEvent as ReactSyntheticEvent,
+  type TouchEvent as ReactTouchEvent,
 } from 'react'
 import {
   Check,
@@ -38,6 +41,7 @@ import {
 } from 'lucide-react'
 import { io } from 'socket.io-client'
 import type { Socket } from 'socket.io-client'
+import youwatchLogo from './assets/YouWatch.png'
 import './App.css'
 
 type PlaybackStatus = 'playing' | 'paused'
@@ -238,6 +242,8 @@ const OWNER_TRANSIENT_PAUSE_GRACE_MS = 2400
 const OWNER_PLAY_COMMAND_GRACE_MS = 1500
 const MOBILE_DOUBLE_TAP_MS = 320
 const MOBILE_DOUBLE_TAP_DISTANCE_PX = 44
+const MOBILE_CHAT_SWIPE_MIN_DISTANCE_PX = 46
+const MOBILE_CHAT_SWIPE_MAX_SIDE_DISTANCE_PX = 92
 const CHAT_IMAGE_MAX_SOURCE_BYTES = 8 * 1024 * 1024
 const CHAT_IMAGE_MAX_BYTES = 700 * 1024
 const CHAT_IMAGE_MAX_DIMENSION = 1280
@@ -476,6 +482,7 @@ function App() {
   const lastOwnerCommandRef = useRef<{ status: PlaybackStatus; issuedAt: number } | null>(null)
   const lastAudibleVolumeRef = useRef(DEFAULT_VOLUME)
   const videoTapRef = useRef<{ timerId: number; time: number; x: number; y: number } | null>(null)
+  const videoSwipeRef = useRef<{ pointerId: number; x: number; y: number; time: number } | null>(null)
   const videoShellRef = useRef<HTMLDivElement | null>(null)
   const timelineRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
@@ -519,6 +526,7 @@ function App() {
         : undefined,
     [timelineStoryboardFrame],
   )
+  const timelinePreviewThumbnailSources = useMemo(() => getTimelinePreviewThumbnailSources(currentVideo), [currentVideo])
   const timelineStyle = useMemo(
     () =>
       ({
@@ -578,6 +586,11 @@ function App() {
     setChatOpen(true)
     setFullscreenIdle(false)
     chatInputRef.current?.focus({ preventScroll: true })
+  }, [])
+
+  const closeChatInput = useCallback(() => {
+    setChatOpen(false)
+    chatInputRef.current?.blur()
   }, [])
 
   const applyEmojiSuggestion = useCallback((option: EmojiOption) => {
@@ -1443,8 +1456,64 @@ function App() {
     socket.emit('owner:play', { currentTime, serverTime: actionServerTime })
   }
 
+  const handleVideoSurfacePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!canUseVideoSwipeGesture(event.pointerType) || (event.target instanceof Element && event.target.closest('button, a, input, .mini-player-topbar'))) {
+      videoSwipeRef.current = null
+      return
+    }
+
+    videoSwipeRef.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      time: event.timeStamp,
+    }
+  }
+
+  const clearVideoGestures = () => {
+    videoSwipeRef.current = null
+  }
+
+  const consumeVideoSurfaceSwipe = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const start = videoSwipeRef.current
+    videoSwipeRef.current = null
+
+    if (!start || start.pointerId !== event.pointerId || !canUseVideoSwipeGesture(event.pointerType)) {
+      return false
+    }
+
+    const deltaX = event.clientX - start.x
+    const deltaY = event.clientY - start.y
+    const distanceY = Math.abs(deltaY)
+    const distanceX = Math.abs(deltaX)
+
+    if (distanceY < MOBILE_CHAT_SWIPE_MIN_DISTANCE_PX || distanceX > MOBILE_CHAT_SWIPE_MAX_SIDE_DISTANCE_PX || distanceY < distanceX * 1.18) {
+      return false
+    }
+
+    if (videoTapRef.current) {
+      window.clearTimeout(videoTapRef.current.timerId)
+      videoTapRef.current = null
+    }
+
+    event.preventDefault()
+
+    if (deltaY < 0) {
+      openChatInput()
+    } else {
+      closeChatInput()
+    }
+
+    return true
+  }
+
   const handleVideoSurfacePointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.target instanceof Element && event.target.closest('button, a, input, .mini-player-topbar')) {
+      clearVideoGestures()
+      return
+    }
+
+    if (consumeVideoSurfaceSwipe(event)) {
       return
     }
 
@@ -1497,8 +1566,7 @@ function App() {
 
   const handleMobileChatButton = () => {
     if (chatOpen) {
-      setChatOpen(false)
-      chatInputRef.current?.blur()
+      closeChatInput()
       return
     }
 
@@ -1781,6 +1849,32 @@ function App() {
     event.currentTarget.style.setProperty('--glass-light-opacity', '0')
   }
 
+  const stopImageLightboxEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
+    event.stopPropagation()
+  }
+
+  const handleImageLightboxBackdropEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
+    event.stopPropagation()
+
+    if (event.target === event.currentTarget) {
+      setPreviewImage(null)
+    }
+  }
+
+  const handleTimelinePreviewImageError = (event: ReactSyntheticEvent<HTMLImageElement>) => {
+    const image = event.currentTarget
+    const fallbackSources = (image.dataset.fallbackSrcs ?? '').split('|').filter(Boolean)
+    const nextSource = fallbackSources.shift()
+
+    if (!nextSource) {
+      image.style.opacity = '0'
+      return
+    }
+
+    image.dataset.fallbackSrcs = fallbackSources.join('|')
+    image.src = nextSource
+  }
+
   return (
     <div
       className="app-shell"
@@ -1801,13 +1895,7 @@ function App() {
 
       <header className="titlebar">
         <div className="brand" aria-label="YouWatch">
-          <span className="brand-mark">
-            <span className="brand-screen">
-              <Play size={15} fill="currentColor" aria-hidden="true" />
-            </span>
-            <span className="brand-orbit" aria-hidden="true" />
-          </span>
-          <span>YouWatch</span>
+          <img className="brand-logo" src={youwatchLogo} alt="YouWatch" />
         </div>
 
         <form className={`search-shell ${searchOpen ? 'is-search-open' : ''}`} ref={searchShellRef} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleSearchSubmit}>
@@ -1885,7 +1973,12 @@ function App() {
       <main className="watch-layout">
         <section className="stage-section" aria-label="Watch room">
           <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef} style={miniPlayerActive ? miniPlayerStyle : undefined}>
-            <div className={`player-surface ${currentVideo ? 'has-video' : ''} ${canControlRoom ? 'can-control' : 'is-viewer'}`} onPointerUp={handleVideoSurfacePointerUp}>
+            <div
+              className={`player-surface ${currentVideo ? 'has-video' : ''} ${canControlRoom ? 'can-control' : 'is-viewer'}`}
+              onPointerDown={handleVideoSurfacePointerDown}
+              onPointerUp={handleVideoSurfacePointerUp}
+              onPointerCancel={clearVideoGestures}
+            >
               <div id={YOUTUBE_PLAYER_ID} className="youtube-player" />
               {!currentVideo && (
                 <div className="empty-player">
@@ -1968,8 +2061,19 @@ function App() {
                 onPointerLeave={handleTimelinePointerLeave}
               >
                 <div className="timeline-preview" aria-hidden="true">
-                  <div className={`timeline-preview-frame ${timelineStoryboardFrame ? 'has-storyboard' : ''}`}>
-                    {timelineStoryboardFrame ? <span className="timeline-storyboard-frame" style={timelineStoryboardStyle} /> : currentVideo && <img src={currentVideo.thumbnail} alt="" />}
+                  <div className={`timeline-preview-frame ${timelineStoryboardFrame ? 'has-storyboard' : 'has-thumbnail'}`}>
+                    {timelineStoryboardFrame ? (
+                      <span className="timeline-storyboard-frame" style={timelineStoryboardStyle} />
+                    ) : (
+                      timelinePreviewThumbnailSources[0] && (
+                        <img
+                          src={timelinePreviewThumbnailSources[0]}
+                          data-fallback-srcs={timelinePreviewThumbnailSources.slice(1).join('|')}
+                          onError={handleTimelinePreviewImageError}
+                          alt=""
+                        />
+                      )
+                    )}
                     <span className="timeline-preview-shade" />
                     <span className="timeline-preview-time">{formatTime(timelinePreview.time)}</span>
                   </div>
@@ -2139,6 +2243,33 @@ function App() {
               </button>
             </form>
 
+            {isFullscreen && previewImage && (
+              <div
+                className="image-lightbox"
+                role="dialog"
+                aria-modal="true"
+                aria-label="Shared image preview"
+                onPointerDown={handleImageLightboxBackdropEvent}
+                onMouseDown={handleImageLightboxBackdropEvent}
+                onTouchStart={handleImageLightboxBackdropEvent}
+                onPointerUp={stopImageLightboxEvent}
+                onMouseUp={stopImageLightboxEvent}
+                onClick={handleImageLightboxBackdropEvent}
+              >
+                <div
+                  className="image-lightbox-content"
+                  onPointerDown={stopImageLightboxEvent}
+                  onMouseDown={stopImageLightboxEvent}
+                  onTouchStart={stopImageLightboxEvent}
+                  onPointerUp={stopImageLightboxEvent}
+                  onMouseUp={stopImageLightboxEvent}
+                  onClick={stopImageLightboxEvent}
+                >
+                  <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
+                </div>
+              </div>
+            )}
+
           </div>
 
           <div className="now-row">
@@ -2168,20 +2299,28 @@ function App() {
         </section>
       </main>
 
-      {previewImage && (
+      {!isFullscreen && previewImage && (
         <div
           className="image-lightbox"
           role="dialog"
           aria-modal="true"
           aria-label="Shared image preview"
-          onPointerDown={(event) => event.stopPropagation()}
-          onPointerUp={(event) => event.stopPropagation()}
-          onClick={(event) => {
-            event.stopPropagation()
-            setPreviewImage(null)
-          }}
+          onPointerDown={handleImageLightboxBackdropEvent}
+          onMouseDown={handleImageLightboxBackdropEvent}
+          onTouchStart={handleImageLightboxBackdropEvent}
+          onPointerUp={stopImageLightboxEvent}
+          onMouseUp={stopImageLightboxEvent}
+          onClick={handleImageLightboxBackdropEvent}
         >
-          <div className="image-lightbox-content" onPointerDown={(event) => event.stopPropagation()} onPointerUp={(event) => event.stopPropagation()} onClick={(event) => event.stopPropagation()}>
+          <div
+            className="image-lightbox-content"
+            onPointerDown={stopImageLightboxEvent}
+            onMouseDown={stopImageLightboxEvent}
+            onTouchStart={stopImageLightboxEvent}
+            onPointerUp={stopImageLightboxEvent}
+            onMouseUp={stopImageLightboxEvent}
+            onClick={stopImageLightboxEvent}
+          >
             <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
           </div>
         </div>
@@ -2456,6 +2595,28 @@ function parseYouTubeVideoId(value: string) {
 
 function validateYouTubeVideoId(value: string) {
   return /^[a-zA-Z0-9_-]{11}$/.test(value) ? value : null
+}
+
+function canUseVideoSwipeGesture(pointerType: string) {
+  return pointerType !== 'mouse' || window.matchMedia('(max-width: 720px)').matches
+}
+
+function getTimelinePreviewThumbnailSources(video?: VideoMeta | null) {
+  if (!video?.id) {
+    return []
+  }
+
+  return Array.from(
+    new Set(
+      [
+        `https://i.ytimg.com/vi/${video.id}/maxresdefault.jpg`,
+        `https://i.ytimg.com/vi/${video.id}/hq720.jpg`,
+        `https://i.ytimg.com/vi/${video.id}/sddefault.jpg`,
+        video.thumbnail,
+        `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg`,
+      ].filter(Boolean),
+    ),
+  )
 }
 
 async function fetchVideoMeta(videoId: string): Promise<VideoMeta> {
