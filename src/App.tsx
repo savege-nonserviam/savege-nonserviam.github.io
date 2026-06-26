@@ -1850,10 +1850,17 @@ function App() {
   }
 
   const stopImageLightboxEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
+    event.preventDefault()
     event.stopPropagation()
   }
 
   const handleImageLightboxBackdropEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
+  const handleImageLightboxBackdropClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault()
     event.stopPropagation()
 
     if (event.target === event.currentTarget) {
@@ -2254,7 +2261,7 @@ function App() {
                 onTouchStart={handleImageLightboxBackdropEvent}
                 onPointerUp={stopImageLightboxEvent}
                 onMouseUp={stopImageLightboxEvent}
-                onClick={handleImageLightboxBackdropEvent}
+                onClick={handleImageLightboxBackdropClick}
               >
                 <div
                   className="image-lightbox-content"
@@ -2310,7 +2317,7 @@ function App() {
           onTouchStart={handleImageLightboxBackdropEvent}
           onPointerUp={stopImageLightboxEvent}
           onMouseUp={stopImageLightboxEvent}
-          onClick={handleImageLightboxBackdropEvent}
+          onClick={handleImageLightboxBackdropClick}
         >
           <div
             className="image-lightbox-content"

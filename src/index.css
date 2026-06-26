@@ -30,8 +30,39 @@
 
 * {
   box-sizing: border-box;
+  scrollbar-color: rgba(105, 225, 199, 0.58) rgba(255, 255, 255, 0.045);
+  scrollbar-width: thin;
   -webkit-tap-highlight-color: transparent;
   -webkit-touch-callout: none;
+}
+
+*::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+*::-webkit-scrollbar-track {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
+    rgba(5, 6, 9, 0.94);
+}
+
+*::-webkit-scrollbar-thumb {
+  border: 3px solid rgba(5, 6, 9, 0.94);
+  border-radius: 999px;
+  background:
+    linear-gradient(180deg, rgba(255, 111, 118, 0.92), rgba(105, 225, 199, 0.9));
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background:
+    linear-gradient(180deg, #ff7d83, #7af1d6);
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-corner {
+  background: rgba(5, 6, 9, 0.94);
 }
 
 *::selection {
