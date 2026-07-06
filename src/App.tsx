@@ -535,6 +535,7 @@ function App() {
   const videoShellRef = useRef<HTMLDivElement | null>(null)
   const timelineRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
+  const roomPanelRef = useRef<HTMLElement | null>(null)
   const chatInputRef = useRef<HTMLInputElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
 
@@ -1370,6 +1371,16 @@ function App() {
       chatInputRef.current?.blur()
     }
   }, [chatOpen])
+
+  useEffect(() => {
+    if (!roomPanelOpen || isFullscreen) {
+      return
+    }
+
+    window.requestAnimationFrame(() => {
+      roomPanelRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    })
+  }, [isFullscreen, roomPanelOpen])
 
   useEffect(() => {
     return () => {
@@ -2267,11 +2278,11 @@ function App() {
         <div className="room-tools">
           <button className="room-pill room-button name-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleEditName} title="Change username">
             <Users size={15} aria-hidden="true" />
-            {displayName || 'Name'}
+            <span className="room-pill-label">{displayName || 'Name'}</span>
           </button>
           <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title={isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted controller' : `Owner: ${roomState?.ownerName ?? 'joining'}`}>
             {isOwner ? <Crown size={15} aria-hidden="true" /> : currentMember?.trusted ? <ShieldCheck size={15} aria-hidden="true" /> : <Lock size={15} aria-hidden="true" />}
-            {roleLabel}
+            <span className="room-pill-label">{roleLabel}</span>
           </span>
           {trustedCount > 0 && (
             <span className="room-pill trusted-count-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title="Trusted viewers">
@@ -2285,11 +2296,11 @@ function App() {
           </span>
           <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={() => setRoomPanelOpen((open) => !open)} title="Room panel">
             <PanelRightOpen size={15} aria-hidden="true" />
-            {queueCount}
+            <span className="room-pill-label">{queueCount}</span>
           </button>
           <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleCopyLink} title="Copy room link">
             {copied ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
-            {copied ? 'Copied' : roomId}
+            <span className="room-pill-label">{copied ? 'Copied' : roomId}</span>
           </button>
         </div>
       </header>
@@ -2649,7 +2660,7 @@ function App() {
           </div>
 
           {roomPanelOpen && (
-            <aside className="room-panel" aria-label="Room panel">
+            <aside className="room-panel" ref={roomPanelRef} aria-label="Room panel">
               <div className="room-panel-header">
                 <div>
                   <p className="eyebrow">Queue</p>
