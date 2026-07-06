@@ -1,6 +1,6 @@
 # YouWatch
 
-YouWatch is a synchronized YouTube watch-room app with owner-only playback controls, server-authoritative room time, shareable room links, titlebar YouTube search/URL loading, and a minimal dark chat overlay.
+YouWatch is a synchronized YouTube watch-room app with owner/trusted playback controls, server-authoritative room time, shareable room links, queue and history management, titlebar YouTube search/URL loading, room moderation, and a minimal dark chat overlay.
 
 ## Run Locally
 
@@ -30,9 +30,27 @@ npm start
 
 `npm start` serves the built client and the real-time API from the same Node process.
 
+## Checks
+
+```bash
+npm run lint
+npm test
+npm run build
+```
+
+The test suite uses Node's built-in test runner for server validation and serialization behavior.
+
 ## Empty Rooms
 
-The server stores watch rooms in memory. When the last connected viewer leaves or disconnects, that room is deleted immediately, including its chat, video state, owner timer, and cleanup timer. If someone later opens the same room link, the server creates a fresh room with that id.
+Active sockets, chat messages, ownership timers, and cleanup timers are stored in memory. When the last connected viewer leaves, the in-memory room is deleted immediately and chat is discarded.
+
+By default, the server also persists non-chat room state to `data/rooms.json`: current video, playback position, room settings, queue, and recently played history. This lets a later visit to the same room hash restore the watch plan without storing chat. Disable this behavior with:
+
+```bash
+ROOM_PERSISTENCE=0
+```
+
+Use `ROOM_PERSISTENCE_FILE=/absolute/path/rooms.json` if the host needs the persistence file outside the project folder.
 
 ## Put This In GitHub
 
@@ -61,6 +79,7 @@ Do not commit generated or private files:
 ```text
 node_modules/
 dist/
+data/
 .env
 *.log
 ```
@@ -87,6 +106,7 @@ Healthcheck path: /api/health
 
 ```text
 YOUTUBE_API_KEY=your_youtube_data_api_key
+ROOM_PERSISTENCE=1
 ```
 
 Railway automatically provides `PORT`, so do not set `PORT` in Railway unless you have a special reason. Leave `CORS_ORIGIN` empty when Railway serves the website and server from the same domain. Set `CORS_ORIGIN` only if you host the frontend somewhere else, for example:

@@ -15,22 +15,31 @@ import {
   type TouchEvent as ReactTouchEvent,
 } from 'react'
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   Copy,
   Crown,
+  History,
   Image as ImageIcon,
   Link as LinkIcon,
+  ListPlus,
   LoaderCircle,
   Lock,
+  LockOpen,
   Maximize2,
   MessageCircle,
   Minimize2,
+  PanelRightOpen,
   Pause,
   Play,
   RotateCcw,
   Search as SearchIcon,
   Send,
+  Settings2,
   ShieldCheck,
+  SkipForward,
+  Trash2,
   UserCheck,
   Users,
   Volume2,
@@ -48,6 +57,7 @@ type PlaybackStatus = 'playing' | 'paused'
 type MaterialComplexity = 'simple' | 'busy' | 'dense'
 type ScrollState = 'top' | 'scrolled' | 'compressed'
 type ScrollDirection = 'idle' | 'up' | 'down'
+type SyncStatus = 'offline' | 'idle' | 'buffering' | 'behind' | 'synced'
 
 type VideoMeta = {
   id: string
@@ -66,6 +76,33 @@ type RoomMember = {
   trusted: boolean
 }
 
+type RoomSettings = {
+  controlsLocked: boolean
+  queueAutoplay: boolean
+}
+
+type QueueItem = {
+  id: string
+  video: VideoMeta
+  addedByClientId: string
+  addedByName: string
+  addedAt: number
+}
+
+type HistoryItem = {
+  id: string
+  video: VideoMeta
+  playedByClientId: string
+  playedByName: string
+  playedAt: number
+}
+
+type ChatReaction = {
+  emoji: string
+  count: number
+  clientIds: string[]
+}
+
 type ChatImage = {
   dataUrl: string
   mimeType: string
@@ -82,6 +119,7 @@ type ChatMessage = {
   color: string
   body: string
   image?: ChatImage | null
+  reactions?: ChatReaction[]
   createdAt: number
 }
 
@@ -93,6 +131,9 @@ type RoomState = {
   controllerName: string
   members: RoomMember[]
   video: VideoMeta | null
+  settings: RoomSettings
+  queue: QueueItem[]
+  history: HistoryItem[]
   playback: {
     status: PlaybackStatus
     currentTime: number
@@ -230,6 +271,7 @@ const LOCAL_CLIENT_KEY = 'youwatch:client-id'
 const LOCAL_NAME_KEY = 'youwatch:name'
 const LOCAL_NAME_CONFIRMED_KEY = 'youwatch:name-confirmed'
 const LOCAL_VOLUME_KEY = 'youwatch:volume'
+const LOCAL_CHAT_COMPACT_KEY = 'youwatch:chat-compact'
 const DEFAULT_VOLUME = 72
 const SYNC_INTERVAL_MS = 500
 const HEARTBEAT_INTERVAL_MS = 1000
@@ -255,6 +297,7 @@ const QUALITY_RETRY_DELAYS_MS = [0, 350, 900, 1800, 3600]
 const FULLSCREEN_IDLE_DELAY_MS = 1100
 const PLAYBACK_END_BUFFER_SECONDS = 0.75
 const STALE_PLAYBACK_RESET_GRACE_SECONDS = 30
+const CHAT_REACTION_OPTIONS = ['👍', '😂', '❤️', '🔥', '👀'] as const
 const messageTimeFormatter = new Intl.DateTimeFormat(undefined, {
   hour: '2-digit',
   hourCycle: 'h23',
@@ -450,12 +493,17 @@ function App() {
   const [playerReady, setPlayerReady] = useState(false)
   const [playerError, setPlayerError] = useState<string | null>(null)
   const [playerStatus, setPlayerStatus] = useState<PlaybackStatus>('paused')
+  const [playerBuffering, setPlayerBuffering] = useState(false)
+  const [syncDriftSeconds, setSyncDriftSeconds] = useState(0)
   const [volume, setVolume] = useState(getStoredVolume)
   const [muted, setMuted] = useState(false)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [displayTime, setDisplayTime] = useState(0)
   const [duration, setDuration] = useState(0)
+  const [roomPanelOpen, setRoomPanelOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
+  const [chatCompact, setChatCompact] = useState(getStoredChatCompact)
+  const [unreadMessages, setUnreadMessages] = useState(0)
   const [chatDraft, setChatDraft] = useState('')
   const [pendingImage, setPendingImage] = useState<ChatImage | null>(null)
   const [previewImage, setPreviewImage] = useState<{ image: ChatImage; author: string } | null>(null)
@@ -472,6 +520,7 @@ function App() {
 
   const roomStateRef = useRef<RoomState | null>(null)
   const displayNameRef = useRef(displayName)
+  const chatOpenRef = useRef(chatOpen)
   const serverOffsetRef = useRef(0)
   const clockSamplesRef = useRef<ClockSample[]>([])
   const clockSyncedRef = useRef(false)
@@ -490,6 +539,9 @@ function App() {
   const imageInputRef = useRef<HTMLInputElement | null>(null)
 
   const currentVideo = roomState?.video ?? null
+  const roomSettings = roomState?.settings ?? { controlsLocked: false, queueAutoplay: true }
+  const queuedVideos = roomState?.queue ?? []
+  const recentVideos = roomState?.history ?? []
   const canConnect = displayName.length > 0
   const miniPlayerActive = miniPlayerOpen && Boolean(currentVideo)
   const ownerName = roomState?.ownerName ?? ''
@@ -500,7 +552,10 @@ function App() {
     : 'simple'
   const currentMember = roomState?.members.find((member) => member.clientId === clientId) ?? null
   const isOwner = roomState?.ownerId === clientId
-  const canControlRoom = isOwner || Boolean(currentMember?.trusted)
+  const controlsLocked = roomSettings.controlsLocked
+  const canControlRoom = isOwner || (Boolean(currentMember?.trusted) && !controlsLocked)
+  const canManageRoom = isOwner
+  const canManageQueue = isOwner || (Boolean(currentMember?.trusted) && !controlsLocked)
   const memberCount = roomState?.members.length ?? 0
   const trustedCount = roomState?.members.filter((member) => member.trusted).length ?? 0
   const recentMessages = useMemo(() => roomState?.messages.slice(-10) ?? [], [roomState?.messages])
@@ -509,8 +564,11 @@ function App() {
   const effectiveStatus = currentVideo ? roomState?.playback.status ?? playerStatus : 'paused'
   const controlUnavailableMessage = getControlUnavailableMessage(roomState)
   const playbackControlTitle = !currentVideo ? 'Load a video first' : canControlRoom ? (effectiveStatus === 'playing' ? 'Pause' : 'Play') : controlUnavailableMessage
+  const queueCount = queuedVideos.length
   const roleLabel = isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted' : 'Guest'
   const controllerName = roomState?.controllerName || ownerName
+  const syncStatus = getSyncStatus({ connected, currentVideo, playerBuffering, syncDriftSeconds })
+  const syncStatusLabel = getSyncStatusLabel(syncStatus, latencyMs)
   const timelineMax = Math.max(1, Math.floor(duration || displayTime || parseDurationSeconds(currentVideo?.duration) || 1))
   const timelineProgress = currentVideo ? clampNumber((Math.min(displayTime, timelineMax) / timelineMax) * 100, 0, 100) : 0
   const activeVideoStoryboard = videoStoryboard?.videoId === currentVideo?.id ? videoStoryboard : null
@@ -584,6 +642,7 @@ function App() {
   const openChatInput = useCallback(() => {
     setMiniPlayerOpen(false)
     setChatOpen(true)
+    setUnreadMessages(0)
     setFullscreenIdle(false)
     chatInputRef.current?.focus({ preventScroll: true })
   }, [])
@@ -740,19 +799,19 @@ function App() {
       const currentTime = safeCurrentTime(player)
       const driftSeconds = Math.abs(currentTime - targetTime)
       const controlsThisPlayback = state.controllerId === clientId || (isOwner && !state.controllerId)
-      const driftLimit = controlsThisPlayback ? 2.5 : SYNC_HARD_DRIFT_SECONDS
+      const youtubeState = player.getPlayerState()
+      const playerState = window.YT?.PlayerState
+      const isBuffering = youtubeState === playerState?.BUFFERING || youtubeState === playerState?.UNSTARTED
+      const driftLimit = controlsThisPlayback ? 2.5 : isBuffering ? 4.5 : SYNC_HARD_DRIFT_SECONDS
 
       if (driftSeconds > driftLimit) {
         player.seekTo(targetTime, true)
         setPlaybackRate(player, 1)
-      } else if (!controlsThisPlayback && state.playback.status === 'playing' && driftSeconds > SYNC_SOFT_DRIFT_SECONDS) {
+      } else if (!isBuffering && !controlsThisPlayback && state.playback.status === 'playing' && driftSeconds > SYNC_SOFT_DRIFT_SECONDS) {
         setPlaybackRate(player, currentTime < targetTime ? 1 + SYNC_RATE_NUDGE : 1 - SYNC_RATE_NUDGE)
       } else {
         setPlaybackRate(player, 1)
       }
-
-      const youtubeState = player.getPlayerState()
-      const playerState = window.YT?.PlayerState
 
       if (state.playback.status === 'playing') {
         const alreadyMoving = youtubeState === playerState?.PLAYING || youtubeState === playerState?.BUFFERING
@@ -824,6 +883,31 @@ function App() {
     [canControlRoom, playOwnerVideoNow, serverNow],
   )
 
+  const queueVideo = useCallback(
+    (video: VideoMeta, position: 'next' | 'end' = 'end') => {
+      if (!canManageQueue) {
+        setNotice(getControlUnavailableMessage(roomStateRef.current))
+        return
+      }
+
+      socket.emit('queue:add', { video, position }, (response: JoinResponse) => {
+        if (response?.ok && response.state) {
+          setRoomState(response.state)
+          setNotice(position === 'next' ? 'Video added next.' : 'Video added to the queue.')
+          return
+        }
+
+        setNotice(response?.message ?? 'Unable to update the queue.')
+      })
+      setSearchOpen(false)
+      setSearchResults([])
+      setSearchError(null)
+      setSearchAttempted(false)
+      setSearchText('')
+    },
+    [canManageQueue],
+  )
+
   useEffect(() => {
     roomStateRef.current = roomState
   }, [roomState])
@@ -831,6 +915,14 @@ function App() {
   useEffect(() => {
     displayNameRef.current = displayName
   }, [displayName])
+
+  useEffect(() => {
+    chatOpenRef.current = chatOpen
+  }, [chatOpen])
+
+  useEffect(() => {
+    writeLocalStorage(LOCAL_CHAT_COMPACT_KEY, chatCompact ? '1' : '0')
+  }, [chatCompact])
 
   useEffect(() => {
     if (!canConnect) {
@@ -855,6 +947,10 @@ function App() {
     }
 
     const handleChatMessage = (message: ChatMessage) => {
+      if (!chatOpenRef.current && message.clientId !== clientId) {
+        setUnreadMessages((count) => Math.min(99, count + 1))
+      }
+
       setRoomState((previousState) => {
         if (!previousState) {
           return previousState
@@ -920,7 +1016,7 @@ function App() {
       socket.off('clock:pong', handleClockPong)
       socket.disconnect()
     }
-  }, [canConnect, joinRoom, syncClock])
+  }, [canConnect, clientId, joinRoom, syncClock])
 
   useEffect(() => {
     if (!connected) {
@@ -970,8 +1066,28 @@ function App() {
               setPlayerStatus('playing')
             }
 
+            setPlayerBuffering(event.data === playerState?.BUFFERING || event.data === playerState?.UNSTARTED)
+
             if (event.data === playerState?.PAUSED || event.data === playerState?.CUED || event.data === playerState?.ENDED) {
               setPlayerStatus('paused')
+            }
+
+            if (event.data === playerState?.ENDED && roomStateRef.current?.settings?.queueAutoplay && canControlPlaybackState(roomStateRef.current, clientId)) {
+              const state = roomStateRef.current
+              socket.emit('queue:playNext', {}, (response: JoinResponse) => {
+                if (response?.ok && response.state) {
+                  setRoomState(response.state)
+                  return
+                }
+
+                if (state?.video) {
+                  socket.emit('owner:pause', {
+                    currentTime: clampPlaybackTime(safeCurrentTime(event.target), state.video, event.target),
+                    serverTime: serverNow(),
+                  })
+                }
+              })
+              return
             }
 
             const state = roomStateRef.current
@@ -1044,14 +1160,16 @@ function App() {
       if (isUsableYouTubePlayer(player)) {
         const nextDuration = player.getDuration()
         const nextDisplayTime = state?.video ? clampPlaybackTime(safeCurrentTime(player), state.video, player) : 0
+        const targetTime = state?.video ? clampPlaybackTime(estimatePlaybackTime(state), state.video, player) : 0
 
         setDisplayTime(nextDisplayTime)
+        setSyncDriftSeconds(Math.abs(nextDisplayTime - targetTime))
         setDuration(Number.isFinite(nextDuration) ? nextDuration : 0)
       }
     }, SYNC_INTERVAL_MS)
 
     return () => window.clearInterval(intervalId)
-  }, [applyRoomStateToPlayer])
+  }, [applyRoomStateToPlayer, estimatePlaybackTime])
 
   useEffect(() => {
     if (!canControlRoom || !playerReady) {
@@ -1336,6 +1454,7 @@ function App() {
           const nextOpen = !wasOpen
 
           if (nextOpen) {
+            setUnreadMessages(0)
             window.requestAnimationFrame(openChatInput)
           } else {
             chatInputRef.current?.blur()
@@ -1722,6 +1841,162 @@ function App() {
     })
   }
 
+  const handleTransferOwnership = (member: RoomMember) => {
+    if (!isOwner || member.clientId === clientId) {
+      return
+    }
+
+    socket.emit('owner:transferOwnership', { clientId: member.clientId }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        setNotice(`${member.name} is now the owner.`)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to hand off ownership.')
+    })
+  }
+
+  const handleSetRoomSettings = (settings: Partial<RoomSettings>) => {
+    if (!canManageRoom) {
+      setNotice('Only the room owner can change room settings.')
+      return
+    }
+
+    socket.emit('owner:setRoomSettings', settings, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to update room settings.')
+    })
+  }
+
+  const handleResetRoom = (scope: 'video' | 'queue' | 'chat' | 'all') => {
+    if (!canManageRoom) {
+      setNotice('Only the room owner can reset the room.')
+      return
+    }
+
+    socket.emit('owner:resetRoom', { scope }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        setNotice(scope === 'all' ? 'Room reset.' : 'Room updated.')
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to reset the room.')
+    })
+  }
+
+  const handlePlayQueuedItem = (item: QueueItem) => {
+    if (!canManageQueue) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
+    socket.emit('queue:play', { itemId: item.id }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to play that queued video.')
+    })
+  }
+
+  const handlePlayNextQueuedItem = () => {
+    if (!canManageQueue) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
+    socket.emit('queue:playNext', {}, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'The queue is empty.')
+    })
+  }
+
+  const handleMoveQueuedItem = (item: QueueItem, targetIndex: number) => {
+    if (!canManageQueue) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
+    socket.emit('queue:move', { itemId: item.id, targetIndex }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to reorder the queue.')
+    })
+  }
+
+  const handleRemoveQueuedItem = (item: QueueItem) => {
+    if (!canManageQueue) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
+    socket.emit('queue:remove', { itemId: item.id }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to remove that video.')
+    })
+  }
+
+  const handleClearQueue = () => {
+    if (!canManageQueue) {
+      setNotice(getControlUnavailableMessage(roomStateRef.current))
+      return
+    }
+
+    socket.emit('queue:clear', {}, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        setNotice('Queue cleared.')
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to clear the queue.')
+    })
+  }
+
+  const handleReactToMessage = (message: ChatMessage, emoji: string) => {
+    socket.emit('chat:react', { messageId: message.id, emoji }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to react to that message.')
+    })
+  }
+
+  const handleDeleteMessage = (message: ChatMessage) => {
+    if (message.clientId !== clientId && !isOwner) {
+      return
+    }
+
+    socket.emit('chat:delete', { messageId: message.id }, (response: JoinResponse) => {
+      if (response?.ok && response.state) {
+        setRoomState(response.state)
+        return
+      }
+
+      setNotice(response?.message ?? 'Unable to delete that message.')
+    })
+  }
+
   const handleResync = () => {
     const state = roomStateRef.current
 
@@ -1882,9 +2157,41 @@ function App() {
     image.src = nextSource
   }
 
+  useEffect(() => {
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      const target = event.target
+      const isTyping = target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+
+      if (isTyping || nameDialogOpen || previewImage) {
+        return
+      }
+
+      if (event.key === ' ' || event.key.toLowerCase() === 'k') {
+        event.preventDefault()
+        handleTogglePlayback()
+      } else if (event.key.toLowerCase() === 'f') {
+        event.preventDefault()
+        void handleToggleFullscreen()
+      } else if (event.key.toLowerCase() === 'm') {
+        event.preventDefault()
+        handleToggleMute()
+      } else if (event.key.toLowerCase() === 'r') {
+        event.preventDefault()
+        handleResync()
+      } else if (event.key.toLowerCase() === 'q') {
+        event.preventDefault()
+        setRoomPanelOpen((open) => !open)
+      }
+    }
+
+    document.addEventListener('keydown', handleDocumentKeyDown)
+    return () => document.removeEventListener('keydown', handleDocumentKeyDown)
+  })
+
   return (
     <div
       className="app-shell"
+      data-chat-density={chatCompact ? 'compact' : 'comfortable'}
       data-chrome={chromeState}
       data-material={materialComplexity}
       data-mini-player={miniPlayerActive ? 'open' : 'closed'}
@@ -1931,12 +2238,10 @@ function App() {
               {!searching && !searchError && searchAttempted && searchResults.length === 0 && <div className="search-message">No videos found.</div>}
               {!searching && !searchError &&
                 searchResults.map((result) => (
-                  <button
+                  <div
                     className="search-result"
                     key={result.id}
-                    type="button"
                     onMouseDown={(event) => event.preventDefault()}
-                    onClick={() => loadVideo(result, { play: true })}
                   >
                     <img src={result.thumbnail} alt="" />
                     <span className="search-result-copy">
@@ -1945,7 +2250,15 @@ function App() {
                     </span>
                     {result.duration && <span className="duration-chip">{result.duration}</span>}
                     {!canControlRoom && <Lock size={14} aria-hidden="true" />}
-                  </button>
+                    <span className="search-result-actions">
+                      <button className="icon-button" type="button" onClick={() => loadVideo(result, { play: true })} disabled={!canControlRoom} title="Play now" aria-label={`Play ${result.title}`}>
+                        <Play size={15} fill="currentColor" aria-hidden="true" />
+                      </button>
+                      <button className="icon-button" type="button" onClick={() => queueVideo(result)} disabled={!canManageQueue} title="Add to queue" aria-label={`Add ${result.title} to queue`}>
+                        <ListPlus size={15} aria-hidden="true" />
+                      </button>
+                    </span>
+                  </div>
                 ))}
             </div>
           )}
@@ -1970,6 +2283,10 @@ function App() {
             <Users size={15} aria-hidden="true" />
             {memberCount}
           </span>
+          <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={() => setRoomPanelOpen((open) => !open)} title="Room panel">
+            <PanelRightOpen size={15} aria-hidden="true" />
+            {queueCount}
+          </button>
           <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleCopyLink} title="Copy room link">
             {copied ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
             {copied ? 'Copied' : roomId}
@@ -2126,9 +2443,9 @@ function App() {
                 <span className="volume-value">{audibleVolume}</span>
               </div>
 
-              <span className={`sync-pill ${connected ? 'is-online' : 'is-offline'}`}>
+              <span className={`sync-pill is-${syncStatus}`}>
                 {connected ? <Wifi size={15} aria-hidden="true" /> : <WifiOff size={15} aria-hidden="true" />}
-                {connected ? `${latencyMs ?? 0} ms` : 'Offline'}
+                {syncStatusLabel}
               </span>
               {currentVideo && !canControlRoom && (
                 <span className="lock-pill" title={controlUnavailableMessage}>
@@ -2174,6 +2491,7 @@ function App() {
                 aria-label={chatOpen ? 'Close chat' : 'Open chat'}
               >
                 <MessageCircle size={17} aria-hidden="true" />
+                {unreadMessages > 0 && <span className="unread-badge">{unreadMessages}</span>}
               </button>
             </div>
 
@@ -2189,12 +2507,38 @@ function App() {
                     <span className="chat-meta">
                       <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                       <span className="chat-author">{messageIsOwn ? 'You' : message.name}</span>
+                      {(messageIsOwn || isOwner) && (
+                        <button className="chat-delete-button" type="button" onClick={() => handleDeleteMessage(message)} title="Delete message" aria-label="Delete message">
+                          <Trash2 size={11} aria-hidden="true" />
+                        </button>
+                      )}
                     </span>
                     {message.image && (
                       <button className="chat-image-button" type="button" onClick={() => setPreviewImage({ image: message.image as ChatImage, author: messageIsOwn ? 'You' : message.name })} aria-label="Open shared image">
                         <img src={message.image.dataUrl} alt={message.image.name || 'Shared image'} />
                       </button>
                     )}
+                    <span className="chat-reactions">
+                      {(message.reactions ?? []).map((reaction) => (
+                        <button
+                          className={`chat-reaction ${reaction.clientIds.includes(clientId) ? 'is-active' : ''}`}
+                          key={reaction.emoji}
+                          type="button"
+                          onClick={() => handleReactToMessage(message, reaction.emoji)}
+                          aria-label={`React ${reaction.emoji}`}
+                        >
+                          <span>{reaction.emoji}</span>
+                          <strong>{reaction.count}</strong>
+                        </button>
+                      ))}
+                      {CHAT_REACTION_OPTIONS.filter((emoji) => !(message.reactions ?? []).some((reaction) => reaction.emoji === emoji))
+                        .slice(0, 3)
+                        .map((emoji) => (
+                          <button className="chat-reaction is-suggested" key={emoji} type="button" onClick={() => handleReactToMessage(message, emoji)} aria-label={`React ${emoji}`}>
+                            {emoji}
+                          </button>
+                        ))}
+                    </span>
                   </article>
                 )
               })}
@@ -2303,6 +2647,129 @@ function App() {
               ))}
             </div>
           </div>
+
+          {roomPanelOpen && (
+            <aside className="room-panel" aria-label="Room panel">
+              <div className="room-panel-header">
+                <div>
+                  <p className="eyebrow">Queue</p>
+                  <h2>{queueCount > 0 ? `${queueCount} upcoming` : 'No queued videos'}</h2>
+                </div>
+                <div className="room-panel-actions">
+                  <button className="icon-button" type="button" onClick={handlePlayNextQueuedItem} disabled={!canManageQueue || queueCount === 0} title="Play next queued video" aria-label="Play next queued video">
+                    <SkipForward size={16} aria-hidden="true" />
+                  </button>
+                  <button className="icon-button" type="button" onClick={handleClearQueue} disabled={!canManageQueue || queueCount === 0} title="Clear queue" aria-label="Clear queue">
+                    <Trash2 size={16} aria-hidden="true" />
+                  </button>
+                </div>
+              </div>
+
+              <div className="queue-list">
+                {queuedVideos.length === 0 && <p className="panel-empty">Search for videos and add them to the queue.</p>}
+                {queuedVideos.map((item, index) => (
+                  <article className="queue-item" key={item.id}>
+                    <img src={item.video.thumbnail} alt="" />
+                    <div className="queue-copy">
+                      <strong>{item.video.title}</strong>
+                      <span>{item.video.author}</span>
+                      <small>Added by {item.addedByClientId === clientId ? 'you' : item.addedByName}</small>
+                    </div>
+                    <div className="queue-actions">
+                      <button className="icon-button" type="button" onClick={() => handlePlayQueuedItem(item)} disabled={!canManageQueue} title="Play this video" aria-label={`Play ${item.video.title}`}>
+                        <Play size={14} fill="currentColor" aria-hidden="true" />
+                      </button>
+                      <button className="icon-button" type="button" onClick={() => handleMoveQueuedItem(item, index - 1)} disabled={!canManageQueue || index === 0} title="Move up" aria-label="Move queued video up">
+                        <ArrowUp size={14} aria-hidden="true" />
+                      </button>
+                      <button className="icon-button" type="button" onClick={() => handleMoveQueuedItem(item, index + 1)} disabled={!canManageQueue || index === queuedVideos.length - 1} title="Move down" aria-label="Move queued video down">
+                        <ArrowDown size={14} aria-hidden="true" />
+                      </button>
+                      <button className="icon-button" type="button" onClick={() => handleRemoveQueuedItem(item)} disabled={!canManageQueue} title="Remove" aria-label={`Remove ${item.video.title}`}>
+                        <Trash2 size={14} aria-hidden="true" />
+                      </button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+
+              <div className="panel-grid">
+                <section className="panel-section" aria-label="Room controls">
+                  <div className="panel-section-header">
+                    <Settings2 size={16} aria-hidden="true" />
+                    <h3>Room Controls</h3>
+                  </div>
+                  <label className="panel-toggle">
+                    <input type="checkbox" checked={controlsLocked} onChange={(event) => handleSetRoomSettings({ controlsLocked: event.currentTarget.checked })} disabled={!canManageRoom} />
+                    <span>{controlsLocked ? <Lock size={15} aria-hidden="true" /> : <LockOpen size={15} aria-hidden="true" />}</span>
+                    Owner-only controls
+                  </label>
+                  <label className="panel-toggle">
+                    <input type="checkbox" checked={roomSettings.queueAutoplay} onChange={(event) => handleSetRoomSettings({ queueAutoplay: event.currentTarget.checked })} disabled={!canManageRoom} />
+                    <span><SkipForward size={15} aria-hidden="true" /></span>
+                    Autoplay queue
+                  </label>
+                  <label className="panel-toggle">
+                    <input type="checkbox" checked={chatCompact} onChange={(event) => setChatCompact(event.currentTarget.checked)} />
+                    <span><MessageCircle size={15} aria-hidden="true" /></span>
+                    Compact chat
+                  </label>
+                  <div className="reset-actions" aria-label="Reset room actions">
+                    <button type="button" onClick={() => handleResetRoom('video')} disabled={!canManageRoom}>Clear video</button>
+                    <button type="button" onClick={() => handleResetRoom('queue')} disabled={!canManageRoom}>Clear queue</button>
+                    <button type="button" onClick={() => handleResetRoom('chat')} disabled={!canManageRoom}>Clear chat</button>
+                    <button type="button" onClick={() => handleResetRoom('all')} disabled={!canManageRoom}>Reset all</button>
+                  </div>
+                </section>
+
+                <section className="panel-section" aria-label="Members">
+                  <div className="panel-section-header">
+                    <Users size={16} aria-hidden="true" />
+                    <h3>Members</h3>
+                  </div>
+                  <div className="member-list">
+                    {roomState?.members.map((member) => (
+                      <article className="member-row" key={member.clientId}>
+                        <span className={`member-avatar ${member.trusted ? 'is-trusted' : ''} ${member.clientId === roomState.ownerId ? 'is-owner' : ''}`} style={{ '--member-color': member.color } as CSSProperties}>
+                          <span className="member-initial">{member.name.slice(0, 1).toUpperCase()}</span>
+                          {member.clientId === roomState.ownerId ? <Crown className="member-role-icon" size={11} aria-hidden="true" /> : member.trusted ? <ShieldCheck className="member-role-icon" size={11} aria-hidden="true" /> : null}
+                        </span>
+                        <span className="member-row-copy">
+                          <strong>{member.clientId === clientId ? 'You' : member.name}</strong>
+                          <small>{member.clientId === roomState.ownerId ? 'Owner' : member.trusted ? 'Trusted controller' : 'Viewer'}</small>
+                        </span>
+                        {isOwner && member.clientId !== clientId && (
+                          <span className="member-row-actions">
+                            <button type="button" onClick={() => handleToggleTrusted(member)}>{member.trusted ? 'Untrust' : 'Trust'}</button>
+                            <button type="button" onClick={() => handleTransferOwnership(member)}>Owner</button>
+                          </span>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="panel-section" aria-label="Recently played">
+                  <div className="panel-section-header">
+                    <History size={16} aria-hidden="true" />
+                    <h3>Recently Played</h3>
+                  </div>
+                  <div className="history-list">
+                    {recentVideos.length === 0 && <p className="panel-empty">Played videos will appear here.</p>}
+                    {recentVideos.slice(0, 8).map((item) => (
+                      <button className="history-item" key={item.id} type="button" onClick={() => loadVideo(item.video, { play: true })} disabled={!canControlRoom}>
+                        <img src={item.video.thumbnail} alt="" />
+                        <span>
+                          <strong>{item.video.title}</strong>
+                          <small>{item.playedByClientId === clientId ? 'Played by you' : `Played by ${item.playedByName}`}</small>
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </div>
+            </aside>
+          )}
         </section>
       </main>
 
@@ -2947,6 +3414,41 @@ function getStoredVolume() {
   return clampVolume(Number.isFinite(storedVolume) ? storedVolume : DEFAULT_VOLUME)
 }
 
+function getStoredChatCompact() {
+  return readLocalStorage(LOCAL_CHAT_COMPACT_KEY) === '1'
+}
+
+function getSyncStatus(options: { connected: boolean; currentVideo: VideoMeta | null; playerBuffering: boolean; syncDriftSeconds: number }): SyncStatus {
+  if (!options.connected) {
+    return 'offline'
+  }
+
+  if (!options.currentVideo) {
+    return 'idle'
+  }
+
+  if (options.playerBuffering) {
+    return 'buffering'
+  }
+
+  return options.syncDriftSeconds > SYNC_HARD_DRIFT_SECONDS ? 'behind' : 'synced'
+}
+
+function getSyncStatusLabel(status: SyncStatus, latencyMs: number | null) {
+  switch (status) {
+    case 'offline':
+      return 'Offline'
+    case 'idle':
+      return latencyMs === null ? 'Ready' : `${latencyMs} ms`
+    case 'buffering':
+      return 'Buffering'
+    case 'behind':
+      return 'Behind'
+    case 'synced':
+      return latencyMs === null ? 'Synced' : `Synced ${latencyMs} ms`
+  }
+}
+
 function readLocalStorage(key: string) {
   try {
     return localStorage.getItem(key) ?? ''
@@ -2998,6 +3500,10 @@ function isLongChatBody(value: string) {
 }
 
 function getControlUnavailableMessage(state: RoomState | null) {
+  if (state?.settings?.controlsLocked) {
+    return 'The room owner locked playback and queue controls.'
+  }
+
   const ownerName = state?.ownerName?.trim()
   return ownerName ? `Only ${ownerName} and trusted viewers can control playback.` : 'Only the host and trusted viewers can control playback.'
 }
@@ -3007,7 +3513,7 @@ function canControlPlaybackState(state: RoomState, clientId: string) {
     return true
   }
 
-  return Boolean(state.members.find((member) => member.clientId === clientId)?.trusted)
+  return !state.settings?.controlsLocked && Boolean(state.members.find((member) => member.clientId === clientId)?.trusted)
 }
 
 function getMemberTitle(member: RoomMember, ownerId: string, canToggle: boolean) {

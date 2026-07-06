@@ -5,8 +5,12 @@ import { createServer } from 'node:http'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { Server } from 'socket.io'
 
+const currentFilePath = fileURLToPath(import.meta.url)
+const currentDirectory = path.dirname(currentFilePath)
+const distDirectory = path.resolve(currentDirectory, '../dist')
 const PORT = Number(process.env.PORT ?? 3001)
 const ROOM_IDLE_TTL_MS = 10 * 60 * 1000
 const EMPTY_ROOM_DELETE_DELAY_MS = 0
@@ -14,6 +18,8 @@ const OWNER_GRACE_MS = 12 * 1000
 const MAX_MESSAGES = 70
 const MAX_SEARCH_RESULTS = 10
 const YOUTUBE_SEARCH_FETCH_LIMIT = 20
+const MAX_QUEUE_ITEMS = 60
+const MAX_HISTORY_ITEMS = 24
 const PLAYBACK_END_BUFFER_SECONDS = 0.75
 const STALE_PLAYBACK_RESET_GRACE_SECONDS = 30
 const MAX_OWNER_EVENT_AGE_MS = 15 * 1000
@@ -23,8 +29,12 @@ const MAX_CHAT_BODY_LENGTH = 400
 const MAX_CHAT_IMAGE_BYTES = 700 * 1024
 const MAX_CHAT_IMAGE_DIMENSION = 1600
 const MAX_SOCKET_PAYLOAD_BYTES = 1_200_000
+const MAX_REACTIONS_PER_MESSAGE = 6
 const STORYBOARD_CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const PRESENCE_UPDATE_MIN_INTERVAL_MS = 50
+const ROOM_PERSISTENCE_ENABLED = process.env.ROOM_PERSISTENCE !== '0'
+const ROOM_PERSISTENCE_FILE = path.resolve(process.env.ROOM_PERSISTENCE_FILE || path.join(currentDirectory, '../data/rooms.json'))
+const ROOM_PERSISTENCE_FLUSH_MS = 350
 const PRESENCE_ROOM_BOUNDS = {
   minX: -5.4,
   maxX: 5.4,
@@ -33,6 +43,11 @@ const PRESENCE_ROOM_BOUNDS = {
 }
 const MEMBER_COLORS = ['#ff5c66', '#f2bf5b', '#5ee0c6', '#69a7ff', '#b99cff', '#ff8abf', '#a5dc6d', '#7dd3fc']
 const DEFAULT_CORS_ORIGINS = ['https://savege-nonserviam.github.io']
+const DEFAULT_ROOM_SETTINGS = Object.freeze({
+  controlsLocked: false,
+  queueAutoplay: true,
+})
+const REACTION_EMOJIS = new Set(['👍', '😂', '❤️', '🔥', '👏', '👀', '😭', '💀', '🎉', '🍿'])
 const EMOJI_SHORTCODES = new Map([
   ['smile', '🙂'],
   ['happy', '🙂'],
@@ -139,8 +154,16 @@ const io = new Server(httpServer, {
 
 const rooms = new Map()
 const storyboardCache = new Map()
+const persistedRooms = loadPersistedRooms()
+let persistenceFlushTimer = null
 
 app.disable('x-powered-by')
+app.use((_request, response, next) => {
+  response.setHeader('X-Content-Type-Options', 'nosniff')
+  response.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin')
+  response.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+  next()
+})
 app.use((request, response, next) => {
   const origin = request.headers.origin
 
@@ -413,6 +436,11 @@ io.on('connection', (socket) => {
       return
     }
 
+    if (!allowSocketEvent(socket, 'chat:send', 8, 10_000)) {
+      emitRoomError(socket, 'RATE_LIMITED', 'Slow down before sending another message.')
+      return
+    }
+
     const body = normalizeChatBody(payload?.body)
     const image = normalizeChatImage(payload?.image)
 
@@ -427,12 +455,69 @@ io.on('connection', (socket) => {
       color: member.color,
       body,
       image,
+      reactions: {},
       createdAt: Date.now(),
     }
 
     room.messages.push(message)
     room.messages = room.messages.slice(-MAX_MESSAGES)
-    io.to(room.id).emit('chat:message', message)
+    io.to(room.id).emit('chat:message', serializeChatMessage(message))
+  })
+
+  socket.on('chat:react', (payload, reply) => {
+    const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
+
+    if (!room || !member?.connected) {
+      reply?.({ ok: false, message: 'Join the room before reacting.' })
+      return
+    }
+
+    if (!allowSocketEvent(socket, 'chat:react', 18, 10_000)) {
+      reply?.({ ok: false, message: 'Slow down before reacting again.' })
+      return
+    }
+
+    const message = room.messages.find((entry) => entry.id === cleanText(payload?.messageId, 80))
+    const emoji = normalizeReactionEmoji(payload?.emoji)
+
+    if (!message || !emoji) {
+      reply?.({ ok: false, message: 'Choose a valid message and reaction.' })
+      return
+    }
+
+    toggleMessageReaction(message, emoji, member.clientId)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('chat:delete', (payload, reply) => {
+    const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
+
+    if (!room || !member?.connected) {
+      reply?.({ ok: false, message: 'Join the room before deleting messages.' })
+      return
+    }
+
+    const messageId = cleanText(payload?.messageId, 80)
+    const message = room.messages.find((entry) => entry.id === messageId)
+
+    if (!message) {
+      reply?.({ ok: false, message: 'That message is no longer available.' })
+      return
+    }
+
+    if (message.clientId !== member.clientId && room.ownerId !== member.clientId) {
+      reply?.({ ok: false, message: 'Only your messages or the room owner can delete that.' })
+      return
+    }
+
+    room.messages = room.messages.filter((entry) => entry.id !== messageId)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
   })
 
   socket.on('member:updateName', (payload, reply) => {
@@ -507,8 +592,244 @@ io.on('connection', (socket) => {
     io.to(room.id).emit('room:state', state)
   })
 
+  socket.on('owner:transferOwnership', (payload, reply) => {
+    const room = getSocketRoom(socket)
+    const currentOwner = getSocketMember(socket, room)
+
+    if (!ensureOwner(socket, room) || !currentOwner?.connected) {
+      reply?.({ ok: false, message: 'Only the room owner can hand off ownership.' })
+      return
+    }
+
+    const targetClientId = cleanText(payload?.clientId, 80)
+    const targetMember = room.members.get(targetClientId)
+
+    if (!targetMember?.connected || targetMember.clientId === room.ownerId) {
+      reply?.({ ok: false, message: 'Choose a connected viewer.' })
+      return
+    }
+
+    currentOwner.trusted = true
+    targetMember.trusted = false
+    room.ownerId = targetMember.clientId
+    room.ownerName = targetMember.name
+    room.controllerId = targetMember.clientId
+    persistRoom(room)
+
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('owner:setRoomSettings', (payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureOwner(socket, room)) {
+      reply?.({ ok: false, message: 'Only the room owner can change room settings.' })
+      return
+    }
+
+    room.settings = normalizeRoomSettings({ ...room.settings, ...payload })
+
+    if (room.settings.controlsLocked) {
+      const controller = room.members.get(room.controllerId)
+
+      if (controller?.clientId !== room.ownerId) {
+        room.controllerId = room.ownerId
+      }
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('owner:resetRoom', (payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureOwner(socket, room)) {
+      reply?.({ ok: false, message: 'Only the room owner can reset the room.' })
+      return
+    }
+
+    const scope = ['video', 'queue', 'chat', 'all'].includes(payload?.scope) ? payload.scope : 'all'
+
+    if (scope === 'video' || scope === 'all') {
+      room.video = null
+      room.status = 'paused'
+      room.baseTime = 0
+      room.updatedAt = Date.now()
+      room.controllerId = room.ownerId
+    }
+
+    if (scope === 'queue' || scope === 'all') {
+      room.queue = []
+      room.history = scope === 'all' ? [] : room.history
+    }
+
+    if (scope === 'chat' || scope === 'all') {
+      room.messages = []
+    }
+
+    if (scope === 'all') {
+      room.settings = normalizeRoomSettings(DEFAULT_ROOM_SETTINGS)
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:add', (payload, reply) => {
+    const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
+
+    if (!ensureController(socket, room) || !member?.connected) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    if (!allowSocketEvent(socket, 'queue:add', 12, 15_000)) {
+      reply?.({ ok: false, message: 'Slow down before adding more videos.' })
+      return
+    }
+
+    const video = normalizeVideo(payload?.video)
+
+    if (!video) {
+      reply?.({ ok: false, message: 'A valid YouTube video is required.' })
+      return
+    }
+
+    if (room.queue.length >= MAX_QUEUE_ITEMS) {
+      reply?.({ ok: false, message: 'The queue is full.' })
+      return
+    }
+
+    const item = createQueueItem(video, member)
+    const position = payload?.position === 'next' ? 'next' : 'end'
+
+    if (position === 'next') {
+      room.queue.unshift(item)
+    } else {
+      room.queue.push(item)
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:remove', (payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    const itemId = cleanText(payload?.itemId, 80)
+    const previousLength = room.queue.length
+    room.queue = room.queue.filter((item) => item.id !== itemId)
+
+    if (room.queue.length === previousLength) {
+      reply?.({ ok: false, message: 'That queued video is no longer available.' })
+      return
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:move', (payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    const itemId = cleanText(payload?.itemId, 80)
+    const currentIndex = room.queue.findIndex((item) => item.id === itemId)
+    const targetIndex = clampNumber(Number(payload?.targetIndex), 0, room.queue.length - 1, currentIndex)
+
+    if (currentIndex < 0 || currentIndex === targetIndex) {
+      reply?.({ ok: false, message: 'Choose a different queue position.' })
+      return
+    }
+
+    const [item] = room.queue.splice(currentIndex, 1)
+    room.queue.splice(targetIndex, 0, item)
+    persistRoom(room)
+
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:clear', (_payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    room.queue = []
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:play', (payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    const itemId = cleanText(payload?.itemId, 80)
+
+    if (!playQueuedItem(room, itemId, socket)) {
+      reply?.({ ok: false, message: 'That queued video is no longer available.' })
+      return
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
+  socket.on('queue:playNext', (_payload, reply) => {
+    const room = getSocketRoom(socket)
+
+    if (!ensureController(socket, room)) {
+      reply?.({ ok: false, message: getControllerRequiredMessage(room) })
+      return
+    }
+
+    if (!playNextQueuedItem(room, socket)) {
+      reply?.({ ok: false, message: 'The queue is empty.' })
+      return
+    }
+
+    persistRoom(room)
+    const state = serializeRoom(room)
+    reply?.({ ok: true, state })
+    io.to(room.id).emit('room:state', state)
+  })
+
   socket.on('owner:loadVideo', (payload) => {
     const room = getSocketRoom(socket)
+    const member = getSocketMember(socket, room)
 
     if (!ensureController(socket, room)) {
       return
@@ -529,6 +850,8 @@ io.on('connection', (socket) => {
     room.baseTime = clampPlaybackTime(normalizeSeconds(payload?.currentTime, 0), room.video)
     room.updatedAt = actionTime
     setRoomController(room, socket)
+    addHistoryVideo(room, video, member)
+    persistRoom(room)
     broadcastRoom(room)
   })
 
@@ -546,6 +869,7 @@ io.on('connection', (socket) => {
     }
 
     room.video = video
+    persistRoom(room)
     broadcastRoom(room)
   })
 
@@ -603,10 +927,6 @@ io.on('connection', (socket) => {
   })
 })
 
-const currentFilePath = fileURLToPath(import.meta.url)
-const currentDirectory = path.dirname(currentFilePath)
-const distDirectory = path.resolve(currentDirectory, '../dist')
-
 app.use(express.static(distDirectory, { fallthrough: true }))
 app.get(/.*/, (request, response, next) => {
   if (request.path.startsWith('/api')) {
@@ -621,9 +941,11 @@ app.get(/.*/, (request, response, next) => {
   })
 })
 
-httpServer.listen(PORT, () => {
-  console.log(`YouWatch server listening on http://localhost:${PORT}`)
-})
+if (isMainModule()) {
+  httpServer.listen(PORT, () => {
+    console.log(`YouWatch server listening on http://localhost:${PORT}`)
+  })
+}
 
 async function fetchVideoDetails(videoIds, includeSnippet = false) {
   const detailsById = new Map()
@@ -862,11 +1184,15 @@ function getOrCreateRoom(roomId) {
     baseTime: 0,
     updatedAt: Date.now(),
     controllerId: '',
+    settings: normalizeRoomSettings(),
+    queue: [],
+    history: [],
     messages: [],
     cleanupTimer: null,
     ownerPromotionTimer: null,
   }
 
+  restorePersistedRoom(room)
   rooms.set(roomId, room)
   return room
 }
@@ -934,8 +1260,8 @@ function ensureOwner(socket, room) {
 function ensureController(socket, room) {
   const member = getSocketMember(socket, room)
 
-  if (!room || !member?.connected || (member.clientId !== room.ownerId && !member.trusted)) {
-    emitRoomError(socket, 'CONTROLLER_REQUIRED', 'Only the room owner or trusted viewers can control playback.')
+  if (!room || !member?.connected || !canMemberControl(room, member)) {
+    emitRoomError(socket, 'CONTROLLER_REQUIRED', getControllerRequiredMessage(room))
     return false
   }
 
@@ -1012,12 +1338,15 @@ function serializeRoom(room) {
       presence: normalizePresence(member.presence, createDefaultPresence(member.clientId, room), serverTime),
     })),
     video: room.video,
+    settings: normalizeRoomSettings(room.settings),
+    queue: room.queue.map(serializeQueueItem),
+    history: room.history.map(serializeHistoryItem),
     playback: {
       status: room.status,
       currentTime: getRoomPlaybackTime(room, serverTime),
       serverTime,
     },
-    messages: room.messages.slice(-MAX_MESSAGES),
+    messages: room.messages.slice(-MAX_MESSAGES).map(serializeChatMessage),
   }
 }
 
@@ -1032,7 +1361,7 @@ function getRoomPlaybackTime(room, now = Date.now()) {
 function getRoomController(room) {
   const controller = room.members.get(room.controllerId)
 
-  if (controller?.connected && (controller.clientId === room.ownerId || controller.trusted)) {
+  if (controller?.connected && canMemberControl(room, controller)) {
     return controller
   }
 
@@ -1040,6 +1369,10 @@ function getRoomController(room) {
 
   if (owner?.connected) {
     return owner
+  }
+
+  if (room.settings?.controlsLocked) {
+    return null
   }
 
   return connectedMembers(room).find((member) => member.trusted) ?? null
@@ -1079,6 +1412,7 @@ function scheduleOwnerPromotion(room) {
       room.ownerName = nextOwner.name
       nextOwner.trusted = false
       room.controllerId = nextOwner.clientId
+      persistRoom(room)
       broadcastRoom(room)
     }
   }, OWNER_GRACE_MS)
@@ -1111,6 +1445,7 @@ function scheduleRoomCleanup(room) {
 }
 
 function deleteRoom(room) {
+  persistRoom(room)
   clearRoomCleanup(room)
   clearOwnerPromotion(room)
   rooms.delete(room.id)
@@ -1141,8 +1476,351 @@ function emitRoomError(socket, code, message) {
   socket.emit('room:error', { code, message })
 }
 
+function canMemberControl(room, member) {
+  if (!room || !member?.connected) {
+    return false
+  }
+
+  if (member.clientId === room.ownerId) {
+    return true
+  }
+
+  return !room.settings?.controlsLocked && Boolean(member.trusted)
+}
+
+function getControllerRequiredMessage(room) {
+  if (room?.settings?.controlsLocked) {
+    return 'The room owner locked playback and queue controls.'
+  }
+
+  return 'Only the room owner or trusted viewers can control playback.'
+}
+
+function normalizeRoomSettings(value = {}) {
+  return {
+    controlsLocked: value?.controlsLocked === true,
+    queueAutoplay: value?.queueAutoplay !== false,
+  }
+}
+
+function createQueueItem(video, member) {
+  return {
+    id: randomUUID(),
+    video,
+    addedByClientId: cleanText(member?.clientId, 80),
+    addedByName: cleanText(member?.name, 24) || 'Viewer',
+    addedAt: Date.now(),
+  }
+}
+
+function serializeQueueItem(item) {
+  return {
+    id: cleanText(item?.id, 80),
+    video: normalizeVideo(item?.video),
+    addedByClientId: cleanText(item?.addedByClientId, 80),
+    addedByName: cleanText(item?.addedByName, 24) || 'Viewer',
+    addedAt: normalizeTimestamp(item?.addedAt),
+  }
+}
+
+function serializeHistoryItem(item) {
+  return {
+    id: cleanText(item?.id, 80),
+    video: normalizeVideo(item?.video),
+    playedByClientId: cleanText(item?.playedByClientId, 80),
+    playedByName: cleanText(item?.playedByName, 24) || 'Viewer',
+    playedAt: normalizeTimestamp(item?.playedAt),
+  }
+}
+
+function serializeChatMessage(message) {
+  return {
+    id: cleanText(message?.id, 80),
+    clientId: cleanText(message?.clientId, 80),
+    name: cleanText(message?.name, 24) || 'Viewer',
+    color: normalizeMemberColor(message?.color),
+    body: cleanText(message?.body, MAX_CHAT_BODY_LENGTH),
+    image: normalizeChatImage(message?.image),
+    reactions: serializeMessageReactions(message?.reactions),
+    createdAt: normalizeTimestamp(message?.createdAt),
+  }
+}
+
+function serializeMessageReactions(reactions) {
+  if (!reactions || typeof reactions !== 'object') {
+    return []
+  }
+
+  return Object.entries(reactions)
+    .map(([emoji, clientIds]) => ({
+      emoji: normalizeReactionEmoji(emoji),
+      count: Array.isArray(clientIds) ? new Set(clientIds.map((clientId) => cleanText(clientId, 80)).filter(Boolean)).size : 0,
+      clientIds: Array.isArray(clientIds) ? Array.from(new Set(clientIds.map((clientId) => cleanText(clientId, 80)).filter(Boolean))) : [],
+    }))
+    .filter((reaction) => reaction.emoji && reaction.count > 0)
+    .slice(0, MAX_REACTIONS_PER_MESSAGE)
+}
+
+function toggleMessageReaction(message, emoji, clientId) {
+  message.reactions = message.reactions && typeof message.reactions === 'object' ? message.reactions : {}
+  const currentReactors = new Set(Array.isArray(message.reactions[emoji]) ? message.reactions[emoji] : [])
+
+  if (currentReactors.has(clientId)) {
+    currentReactors.delete(clientId)
+  } else {
+    currentReactors.add(clientId)
+  }
+
+  if (currentReactors.size === 0) {
+    delete message.reactions[emoji]
+    return
+  }
+
+  if (!message.reactions[emoji] && Object.keys(message.reactions).length >= MAX_REACTIONS_PER_MESSAGE) {
+    return
+  }
+
+  message.reactions[emoji] = Array.from(currentReactors)
+}
+
+function normalizeReactionEmoji(value) {
+  const emoji = String(value ?? '').trim()
+  return REACTION_EMOJIS.has(emoji) ? emoji : ''
+}
+
+function playQueuedItem(room, itemId, socket) {
+  const queueIndex = room.queue.findIndex((item) => item.id === itemId)
+
+  if (queueIndex < 0) {
+    return false
+  }
+
+  const [item] = room.queue.splice(queueIndex, 1)
+  loadQueuedVideo(room, item, socket)
+  return true
+}
+
+function playNextQueuedItem(room, socket) {
+  const item = room.queue.shift()
+
+  if (!item) {
+    return false
+  }
+
+  loadQueuedVideo(room, item, socket)
+  return true
+}
+
+function loadQueuedVideo(room, item, socket) {
+  const member = getSocketMember(socket, room)
+
+  room.video = item.video
+  room.status = 'playing'
+  room.baseTime = 0
+  room.updatedAt = Date.now()
+  setRoomController(room, socket)
+  addHistoryVideo(room, item.video, member)
+}
+
+function addHistoryVideo(room, video, member) {
+  const normalizedVideo = normalizeVideo(video)
+
+  if (!normalizedVideo) {
+    return
+  }
+
+  const previous = room.history[0]
+
+  if (previous?.video?.id === normalizedVideo.id) {
+    previous.playedAt = Date.now()
+    previous.playedByClientId = cleanText(member?.clientId, 80)
+    previous.playedByName = cleanText(member?.name, 24) || 'Viewer'
+    return
+  }
+
+  room.history = [
+    {
+      id: randomUUID(),
+      video: normalizedVideo,
+      playedByClientId: cleanText(member?.clientId, 80),
+      playedByName: cleanText(member?.name, 24) || 'Viewer',
+      playedAt: Date.now(),
+    },
+    ...room.history.filter((item) => item.video?.id !== normalizedVideo.id),
+  ].slice(0, MAX_HISTORY_ITEMS)
+}
+
+function allowSocketEvent(socket, key, maxEvents, windowMs) {
+  const now = Date.now()
+  socket.data.rateLimits ??= new Map()
+  const limits = socket.data.rateLimits
+  const current = limits.get(key)
+
+  if (!current || current.resetAt <= now) {
+    limits.set(key, { count: 1, resetAt: now + windowMs })
+    return true
+  }
+
+  current.count += 1
+  return current.count <= maxEvents
+}
+
+function normalizeTimestamp(value) {
+  const timestamp = Number(value)
+  return Number.isFinite(timestamp) && timestamp > 0 ? timestamp : Date.now()
+}
+
+function normalizeMemberColor(value) {
+  return rgbFromHexColor(value) ? value : MEMBER_COLORS[0]
+}
+
+function loadPersistedRooms() {
+  const snapshots = new Map()
+
+  if (!ROOM_PERSISTENCE_ENABLED || !existsSync(ROOM_PERSISTENCE_FILE)) {
+    return snapshots
+  }
+
+  try {
+    const payload = JSON.parse(readFileSync(ROOM_PERSISTENCE_FILE, 'utf8'))
+    const roomsPayload = payload?.rooms && typeof payload.rooms === 'object' ? payload.rooms : {}
+
+    for (const [roomId, snapshot] of Object.entries(roomsPayload)) {
+      const normalizedRoomId = normalizeRoomId(roomId)
+
+      if (normalizedRoomId) {
+        snapshots.set(normalizedRoomId, normalizePersistedSnapshot(snapshot))
+      }
+    }
+  } catch (error) {
+    console.error('Room persistence load error:', error)
+  }
+
+  return snapshots
+}
+
+function normalizePersistedSnapshot(snapshot) {
+  const video = normalizeVideo(snapshot?.video)
+
+  return {
+    video,
+    baseTime: clampPlaybackTime(snapshot?.baseTime, video),
+    settings: normalizeRoomSettings(snapshot?.settings),
+    queue: Array.isArray(snapshot?.queue) ? snapshot.queue.map(normalizePersistedQueueItem).filter(Boolean).slice(0, MAX_QUEUE_ITEMS) : [],
+    history: Array.isArray(snapshot?.history) ? snapshot.history.map(normalizePersistedHistoryItem).filter(Boolean).slice(0, MAX_HISTORY_ITEMS) : [],
+  }
+}
+
+function normalizePersistedQueueItem(item) {
+  const video = normalizeVideo(item?.video)
+
+  if (!video) {
+    return null
+  }
+
+  return {
+    id: cleanText(item?.id, 80) || randomUUID(),
+    video,
+    addedByClientId: cleanText(item?.addedByClientId, 80),
+    addedByName: cleanText(item?.addedByName, 24) || 'Viewer',
+    addedAt: normalizeTimestamp(item?.addedAt),
+  }
+}
+
+function normalizePersistedHistoryItem(item) {
+  const video = normalizeVideo(item?.video)
+
+  if (!video) {
+    return null
+  }
+
+  return {
+    id: cleanText(item?.id, 80) || randomUUID(),
+    video,
+    playedByClientId: cleanText(item?.playedByClientId, 80),
+    playedByName: cleanText(item?.playedByName, 24) || 'Viewer',
+    playedAt: normalizeTimestamp(item?.playedAt),
+  }
+}
+
+function restorePersistedRoom(room) {
+  const snapshot = persistedRooms.get(room.id)
+
+  if (!snapshot) {
+    return
+  }
+
+  room.video = snapshot.video
+  room.status = 'paused'
+  room.baseTime = snapshot.baseTime
+  room.updatedAt = Date.now()
+  room.settings = normalizeRoomSettings(snapshot.settings)
+  room.queue = snapshot.queue.map((item) => ({ ...item, video: normalizeVideo(item.video) })).filter((item) => item.video)
+  room.history = snapshot.history.map((item) => ({ ...item, video: normalizeVideo(item.video) })).filter((item) => item.video)
+}
+
+function persistRoom(room) {
+  if (!ROOM_PERSISTENCE_ENABLED || !room?.id) {
+    return
+  }
+
+  persistedRooms.set(room.id, {
+    video: normalizeVideo(room.video),
+    baseTime: clampPlaybackTime(getRoomPlaybackTime(room), room.video),
+    settings: normalizeRoomSettings(room.settings),
+    queue: room.queue.map(serializeQueueItem).filter((item) => item.video),
+    history: room.history.map(serializeHistoryItem).filter((item) => item.video),
+  })
+  schedulePersistedRoomsWrite()
+}
+
+function schedulePersistedRoomsWrite() {
+  if (persistenceFlushTimer) {
+    clearTimeout(persistenceFlushTimer)
+  }
+
+  persistenceFlushTimer = setTimeout(writePersistedRooms, ROOM_PERSISTENCE_FLUSH_MS)
+  persistenceFlushTimer.unref?.()
+}
+
+function writePersistedRooms() {
+  persistenceFlushTimer = null
+
+  if (!ROOM_PERSISTENCE_ENABLED) {
+    return
+  }
+
+  try {
+    mkdirSync(path.dirname(ROOM_PERSISTENCE_FILE), { recursive: true })
+    writeFileSync(
+      ROOM_PERSISTENCE_FILE,
+      JSON.stringify(
+        {
+          version: 1,
+          updatedAt: new Date().toISOString(),
+          rooms: Object.fromEntries(persistedRooms.entries()),
+        },
+        null,
+        2,
+      ),
+    )
+  } catch (error) {
+    console.error('Room persistence write error:', error)
+  }
+}
+
+function isMainModule() {
+  return process.argv[1] ? path.resolve(process.argv[1]) === currentFilePath : false
+}
+
 function normalizeRoomId(value) {
-  const roomId = cleanText(value, 48).toLowerCase()
+  const rawRoomId = String(value ?? '').replace(/\s+/g, ' ').trim()
+
+  if (rawRoomId.length > 48) {
+    return ''
+  }
+
+  const roomId = rawRoomId.toLowerCase()
   return /^[a-z0-9-]{3,48}$/.test(roomId) ? roomId : ''
 }
 
@@ -1444,4 +2122,15 @@ function formatIsoDuration(duration) {
   }
 
   return `${minutes}:${String(seconds).padStart(2, '0')}`
+}
+
+export {
+  clampPlaybackTime,
+  normalizeChatImage,
+  normalizeRoomId,
+  normalizeRoomSettings,
+  normalizeVideo,
+  parseFormattedDurationSeconds,
+  serializeChatMessage,
+  serializeMessageReactions,
 }
