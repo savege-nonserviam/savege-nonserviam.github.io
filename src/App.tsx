@@ -12,7 +12,6 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
   type SyntheticEvent as ReactSyntheticEvent,
-  type TouchEvent as ReactTouchEvent,
 } from 'react'
 import {
   ArrowDown,
@@ -40,7 +39,6 @@ import {
   ShieldCheck,
   SkipForward,
   Trash2,
-  UserCheck,
   Users,
   Volume2,
   VolumeX,
@@ -58,6 +56,8 @@ type MaterialComplexity = 'simple' | 'busy' | 'dense'
 type ScrollState = 'top' | 'scrolled' | 'compressed'
 type ScrollDirection = 'idle' | 'up' | 'down'
 type SyncStatus = 'offline' | 'idle' | 'buffering' | 'behind' | 'synced'
+type NoticeTone = 'success' | 'info' | 'error'
+type ConnectionPhase = 'live' | 'joining' | 'reconnecting' | 'offline'
 
 type VideoMeta = {
   id: string
@@ -148,6 +148,29 @@ type JoinResponse = {
   message?: string
 }
 
+type ActionResponse = {
+  ok: boolean
+  state?: RoomState
+  message?: string
+}
+
+type PlaybackStateEvent = {
+  videoId: string
+  controllerId: string
+  controllerName: string
+  playback: RoomState['playback']
+}
+
+type NoticeMessage = {
+  message: string
+  tone: NoticeTone
+}
+
+type ConfirmationAction =
+  | { kind: 'transfer-owner'; member: RoomMember }
+  | { kind: 'reset-room'; scope: 'video' | 'queue' | 'chat' | 'all' }
+  | { kind: 'clear-queue' }
+
 type SearchResult = VideoMeta & {
   duration: string
   publishedAt: string
@@ -221,6 +244,7 @@ type YouTubePlayer = {
   getDuration: () => number
   getPlayerState: () => number
   getIframe: () => HTMLIFrameElement
+  stopVideo?: () => void
   destroy: () => void
 }
 
@@ -272,6 +296,8 @@ const LOCAL_NAME_KEY = 'youwatch:name'
 const LOCAL_NAME_CONFIRMED_KEY = 'youwatch:name-confirmed'
 const LOCAL_VOLUME_KEY = 'youwatch:volume'
 const LOCAL_CHAT_COMPACT_KEY = 'youwatch:chat-compact'
+const SESSION_TOKEN_KEY = 'youwatch:session-token'
+const LOCAL_SESSION_TOKEN = getSessionToken()
 const DEFAULT_VOLUME = 72
 const SYNC_INTERVAL_MS = 500
 const HEARTBEAT_INTERVAL_MS = 1000
@@ -294,7 +320,9 @@ const MINI_PLAYER_DEFAULT_OFFSET = 20
 const PREFERRED_PLAYBACK_QUALITY = 'hd1080'
 const PLAYBACK_QUALITY_FALLBACKS = ['highres', 'hd720', 'large', 'medium', 'small', 'tiny', 'default']
 const QUALITY_RETRY_DELAYS_MS = [0, 350, 900, 1800, 3600]
-const FULLSCREEN_IDLE_DELAY_MS = 1100
+const FULLSCREEN_IDLE_DELAY_MS = 2800
+const YOUTUBE_API_TIMEOUT_MS = 12_000
+const CHAT_SEND_TIMEOUT_MS = 8_000
 const PLAYBACK_END_BUFFER_SECONDS = 0.75
 const STALE_PLAYBACK_RESET_GRACE_SECONDS = 30
 const CHAT_REACTION_OPTIONS = ['👍', '😂', '❤️', '🔥', '👀'] as const
@@ -481,8 +509,13 @@ function App() {
   const [roomId] = useState(resolveInitialRoomId)
   const [roomState, setRoomState] = useState<RoomState | null>(null)
   const [connected, setConnected] = useState(socket.connected)
+  const [joined, setJoined] = useState(false)
+  const [hasJoinedOnce, setHasJoinedOnce] = useState(false)
   const [latencyMs, setLatencyMs] = useState<number | null>(null)
-  const [notice, setNotice] = useState<string | null>(null)
+  const [notice, setNoticeState] = useState<NoticeMessage | null>(null)
+  const setNotice = useCallback((message: string | null, tone: NoticeTone = 'error') => {
+    setNoticeState(message ? { message, tone } : null)
+  }, [])
   const [copied, setCopied] = useState(false)
   const [searchText, setSearchText] = useState('')
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
@@ -492,6 +525,8 @@ function App() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [playerReady, setPlayerReady] = useState(false)
   const [playerError, setPlayerError] = useState<string | null>(null)
+  const [youtubeApiError, setYoutubeApiError] = useState<string | null>(null)
+  const [youtubeBootstrapAttempt, setYoutubeBootstrapAttempt] = useState(0)
   const [playerStatus, setPlayerStatus] = useState<PlaybackStatus>('paused')
   const [playerBuffering, setPlayerBuffering] = useState(false)
   const [syncDriftSeconds, setSyncDriftSeconds] = useState(0)
@@ -508,6 +543,8 @@ function App() {
   const [pendingImage, setPendingImage] = useState<ChatImage | null>(null)
   const [previewImage, setPreviewImage] = useState<{ image: ChatImage; author: string } | null>(null)
   const [uploadingImage, setUploadingImage] = useState(false)
+  const [chatSending, setChatSending] = useState(false)
+  const [confirmationAction, setConfirmationAction] = useState<ConfirmationAction | null>(null)
   const [miniPlayerOpen, setMiniPlayerOpen] = useState(false)
   const [miniPlayerPosition, setMiniPlayerPosition] = useState({ right: MINI_PLAYER_DEFAULT_OFFSET, bottom: MINI_PLAYER_DEFAULT_OFFSET })
   const [analyzedMaterial, setAnalyzedMaterial] = useState<{ source: string; complexity: MaterialComplexity } | null>(null)
@@ -521,6 +558,7 @@ function App() {
   const roomStateRef = useRef<RoomState | null>(null)
   const displayNameRef = useRef(displayName)
   const chatOpenRef = useRef(chatOpen)
+  const joinedRef = useRef(joined)
   const serverOffsetRef = useRef(0)
   const clockSamplesRef = useRef<ClockSample[]>([])
   const clockSyncedRef = useRef(false)
@@ -535,9 +573,16 @@ function App() {
   const videoShellRef = useRef<HTMLDivElement | null>(null)
   const timelineRef = useRef<HTMLDivElement | null>(null)
   const searchShellRef = useRef<HTMLFormElement | null>(null)
+  const searchAbortRef = useRef<AbortController | null>(null)
+  const searchRequestIdRef = useRef(0)
   const roomPanelRef = useRef<HTMLElement | null>(null)
+  const roomPanelButtonRef = useRef<HTMLButtonElement | null>(null)
   const chatInputRef = useRef<HTMLInputElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
+  const previewCloseButtonRef = useRef<HTMLButtonElement | null>(null)
+  const previewReturnFocusRef = useRef<HTMLElement | null>(null)
+  const chatSendAttemptRef = useRef(0)
+  const chatSendTimeoutRef = useRef<number | null>(null)
 
   const currentVideo = roomState?.video ?? null
   const roomSettings = roomState?.settings ?? { controlsLocked: false, queueAutoplay: true }
@@ -554,12 +599,13 @@ function App() {
   const currentMember = roomState?.members.find((member) => member.clientId === clientId) ?? null
   const isOwner = roomState?.ownerId === clientId
   const controlsLocked = roomSettings.controlsLocked
-  const canControlRoom = isOwner || (Boolean(currentMember?.trusted) && !controlsLocked)
-  const canManageRoom = isOwner
-  const canManageQueue = isOwner || (Boolean(currentMember?.trusted) && !controlsLocked)
+  const roomMutationReady = connected && joined
+  const canControlRoom = roomMutationReady && (isOwner || (Boolean(currentMember?.trusted) && !controlsLocked))
+  const canManageRoom = roomMutationReady && isOwner
+  const canManageQueue = roomMutationReady && (isOwner || (Boolean(currentMember?.trusted) && !controlsLocked))
   const memberCount = roomState?.members.length ?? 0
   const trustedCount = roomState?.members.filter((member) => member.trusted).length ?? 0
-  const recentMessages = useMemo(() => roomState?.messages.slice(-10) ?? [], [roomState?.messages])
+  const recentMessages = useMemo(() => roomState?.messages.slice(chatOpen ? -8 : -3) ?? [], [chatOpen, roomState?.messages])
   const emojiSuggestions = useMemo(() => (chatOpen ? getEmojiSuggestions(chatDraft) : []), [chatDraft, chatOpen])
   const shareUrl = useMemo(() => `${window.location.origin}${window.location.pathname}${window.location.search}#${roomId}`, [roomId])
   const effectiveStatus = currentVideo ? roomState?.playback.status ?? playerStatus : 'paused'
@@ -568,9 +614,10 @@ function App() {
   const queueCount = queuedVideos.length
   const roleLabel = isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted' : 'Guest'
   const controllerName = roomState?.controllerName || ownerName
-  const syncStatus = getSyncStatus({ connected, currentVideo, playerBuffering, syncDriftSeconds })
+  const syncStatus = getSyncStatus({ connected: connected && joined, currentVideo, playerBuffering, syncDriftSeconds })
   const syncStatusLabel = getSyncStatusLabel(syncStatus, latencyMs)
-  const timelineMax = Math.max(1, Math.floor(duration || displayTime || parseDurationSeconds(currentVideo?.duration) || 1))
+  const timelineDuration = currentVideo ? Math.max(0, Math.floor(duration || displayTime || parseDurationSeconds(currentVideo.duration) || 0)) : 0
+  const timelineMax = Math.max(1, timelineDuration)
   const timelineProgress = currentVideo ? clampNumber((Math.min(displayTime, timelineMax) / timelineMax) * 100, 0, 100) : 0
   const activeVideoStoryboard = videoStoryboard?.videoId === currentVideo?.id ? videoStoryboard : null
   const timelineStoryboardFrame = useMemo(() => getStoryboardFrame(activeVideoStoryboard, timelinePreview.time), [activeVideoStoryboard, timelinePreview.time])
@@ -607,7 +654,11 @@ function App() {
   const contentIsMoving = effectiveStatus === 'playing' || materialMotion
   const materialWeightTarget = materialComplexity === 'dense' ? 1 : materialComplexity === 'busy' ? 0.62 : 0.22
   const scrollDepthTarget = scrollState === 'compressed' ? 1 : scrollState === 'scrolled' ? 0.48 : 0
-  const focusDepthTarget = searchOpen || chatOpen || nameDialogOpen || playerError ? 1 : 0
+  const reconnecting = canConnect && hasJoinedOnce && (!connected || !joined)
+  const connectionPhase: ConnectionPhase = connected && joined ? 'live' : reconnecting ? 'reconnecting' : connected ? 'joining' : 'offline'
+  const connectionLabel = connectionPhase === 'live' ? 'Live' : connectionPhase === 'reconnecting' ? 'Reconnecting' : connectionPhase === 'joining' ? 'Joining' : 'Offline'
+  const confirmationCopy = useMemo(() => getConfirmationCopy(confirmationAction), [confirmationAction])
+  const focusDepthTarget = searchOpen || chatOpen || nameDialogOpen || confirmationAction || previewImage || playerError || youtubeApiError ? 1 : 0
   const chromeState = isFullscreen && fullscreenIdle && !chatOpen ? 'minimal' : searchOpen || chatOpen ? 'active' : scrollState === 'compressed' ? 'compact' : 'expanded'
   const viewMode = isFullscreen ? 'fullscreen' : 'classic'
   const materialDepth = useSpringValue(materialWeightTarget)
@@ -638,6 +689,13 @@ function App() {
 
   useEffect(() => {
     window.scrollTo(0, 0)
+  }, [])
+
+  const cancelActiveSearch = useCallback(() => {
+    searchAbortRef.current?.abort()
+    searchAbortRef.current = null
+    searchRequestIdRef.current += 1
+    setSearching(false)
   }, [])
 
   const openChatInput = useCallback(() => {
@@ -675,7 +733,7 @@ function App() {
         imageInputRef.current.value = ''
       }
     }
-  }, [])
+  }, [setNotice])
 
   const handleChatPaste = useCallback(
     (event: ReactClipboardEvent<HTMLInputElement>) => {
@@ -734,6 +792,48 @@ function App() {
     [clearQualityRetryTimers],
   )
 
+  const resetPlayerForEmptyRoom = useCallback(() => {
+    const player = playerRef.current
+    const hadLoadedVideo = loadedVideoIdRef.current !== null
+
+    if (hadLoadedVideo && isUsableYouTubePlayer(player)) {
+      setPlaybackRate(player, 1)
+
+      try {
+        if (typeof player.stopVideo === 'function') {
+          player.stopVideo()
+        } else {
+          player.pauseVideo()
+        }
+      } catch {
+        try {
+          player.pauseVideo()
+        } catch {
+          setPlayerReady(false)
+        }
+      }
+    }
+
+    loadedVideoIdRef.current = null
+    ownerTransientSinceRef.current = null
+    lastOwnerCommandRef.current = null
+    clearQualityRetryTimers()
+    setPlayerError(null)
+    setPlayerStatus('paused')
+    setPlayerBuffering(false)
+    setSyncDriftSeconds(0)
+    setDisplayTime(0)
+    setDuration(0)
+    setMiniPlayerOpen(false)
+    setTimelinePreview((currentPreview) =>
+      currentPreview.active || currentPreview.percent !== 0 || currentPreview.time !== 0
+        ? { active: false, percent: 0, time: 0 }
+        : currentPreview,
+    )
+    setVideoStoryboard((currentStoryboard) => currentStoryboard ? null : currentStoryboard)
+    setAnalyzedMaterial((currentMaterial) => currentMaterial ? null : currentMaterial)
+  }, [clearQualityRetryTimers])
+
   const estimatePlaybackTime = useCallback(
     (state: RoomState) => {
       const elapsedSeconds = state.playback.status === 'playing' ? Math.max(0, (serverNow() - state.playback.serverTime) / 1000) : 0
@@ -749,19 +849,23 @@ function App() {
       return
     }
 
+    setJoined(false)
     socket.emit(
       'room:join',
-      { roomId, clientId, name },
+      { roomId, clientId, name, sessionToken: LOCAL_SESSION_TOKEN },
       (response: JoinResponse) => {
-        if (response?.ok && response.state) {
+        if (response?.ok && response.state && socket.connected) {
           setRoomState(response.state)
+          setJoined(true)
+          setHasJoinedOnce(true)
           return
         }
 
+        setJoined(false)
         setNotice(response?.message ?? 'Unable to join the room.')
       },
     )
-  }, [clientId, roomId])
+  }, [clientId, roomId, setNotice])
 
   const syncClock = useCallback(() => {
     socket.emit('clock:ping', { clientSentAt: Date.now() })
@@ -771,7 +875,12 @@ function App() {
     (state: RoomState) => {
       const player = playerRef.current
 
-      if (!isUsableYouTubePlayer(player) || !playerReady || !state.video) {
+      if (!state.video) {
+        resetPlayerForEmptyRoom()
+        return
+      }
+
+      if (!isUsableYouTubePlayer(player) || !playerReady) {
         return
       }
 
@@ -794,6 +903,7 @@ function App() {
 
         requestBestPlaybackQuality(player)
         setDisplayTime(targetTime)
+        setDuration(parseDurationSeconds(state.video.duration))
         return
       }
 
@@ -824,7 +934,7 @@ function App() {
         player.pauseVideo()
       }
     },
-    [clientId, estimatePlaybackTime, isOwner, playerError, playerReady, requestBestPlaybackQuality],
+    [clientId, estimatePlaybackTime, isOwner, playerError, playerReady, requestBestPlaybackQuality, resetPlayerForEmptyRoom],
   )
 
   const playOwnerVideoNow = useCallback(
@@ -853,7 +963,7 @@ function App() {
       setPlayerStatus('playing')
       return true
     },
-    [playerReady, requestBestPlaybackQuality],
+    [playerReady, requestBestPlaybackQuality, setNotice],
   )
 
   const loadVideo = useCallback(
@@ -863,10 +973,15 @@ function App() {
         return
       }
 
+      if (video.embeddable === false) {
+        setNotice('This video is not allowed in embedded players.')
+        return
+      }
+
       const started = options.play === true ? playOwnerVideoNow(video, 0) : false
 
       if (!started && options.play === true) {
-        setNotice('The player is still loading. Press play when it is ready.')
+        setNotice('The player is still loading. Press play when it is ready.', 'info')
       }
 
       socket.emit('owner:loadVideo', {
@@ -875,13 +990,14 @@ function App() {
         serverTime: serverNow(),
         status: started ? 'playing' : 'paused',
       })
+      cancelActiveSearch()
       setSearchOpen(false)
       setSearchResults([])
       setSearchError(null)
       setSearchAttempted(false)
       setSearchText('')
     },
-    [canControlRoom, playOwnerVideoNow, serverNow],
+    [canControlRoom, cancelActiveSearch, playOwnerVideoNow, serverNow, setNotice],
   )
 
   const queueVideo = useCallback(
@@ -894,19 +1010,20 @@ function App() {
       socket.emit('queue:add', { video, position }, (response: JoinResponse) => {
         if (response?.ok && response.state) {
           setRoomState(response.state)
-          setNotice(position === 'next' ? 'Video added next.' : 'Video added to the queue.')
+          setNotice(position === 'next' ? 'Video added next.' : 'Video added to the queue.', 'success')
           return
         }
 
         setNotice(response?.message ?? 'Unable to update the queue.')
       })
+      cancelActiveSearch()
       setSearchOpen(false)
       setSearchResults([])
       setSearchError(null)
       setSearchAttempted(false)
       setSearchText('')
     },
-    [canManageQueue],
+    [canManageQueue, cancelActiveSearch, setNotice],
   )
 
   useEffect(() => {
@@ -922,8 +1039,22 @@ function App() {
   }, [chatOpen])
 
   useEffect(() => {
+    joinedRef.current = joined
+  }, [joined])
+
+  useEffect(() => {
     writeLocalStorage(LOCAL_CHAT_COMPACT_KEY, chatCompact ? '1' : '0')
   }, [chatCompact])
+
+  useEffect(() => {
+    return () => {
+      searchAbortRef.current?.abort()
+      chatSendAttemptRef.current += 1
+      if (chatSendTimeoutRef.current !== null) {
+        window.clearTimeout(chatSendTimeoutRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     if (!canConnect) {
@@ -933,14 +1064,22 @@ function App() {
 
     const handleConnect = () => {
       setConnected(true)
+      setJoined(false)
       joinRoom()
       syncClock()
     }
 
     const handleDisconnect = () => {
       setConnected(false)
+      setJoined(false)
       clockSamplesRef.current = []
       clockSyncedRef.current = false
+      chatSendAttemptRef.current += 1
+      if (chatSendTimeoutRef.current !== null) {
+        window.clearTimeout(chatSendTimeoutRef.current)
+        chatSendTimeoutRef.current = null
+      }
+      setChatSending(false)
     }
 
     const handleRoomState = (state: RoomState) => {
@@ -961,6 +1100,33 @@ function App() {
         return {
           ...previousState,
           messages: [...withoutDuplicate, message].slice(-80),
+        }
+      })
+    }
+
+    const handlePlaybackState = (payload: PlaybackStateEvent) => {
+      setRoomState((previousState) => {
+        if (!previousState?.video || payload?.videoId !== previousState.video.id) {
+          return previousState
+        }
+
+        const playback = payload.playback
+        const currentTime = Number(playback?.currentTime)
+        const serverTime = Number(playback?.serverTime)
+
+        if (!playback || !['playing', 'paused'].includes(playback.status) || !Number.isFinite(currentTime) || !Number.isFinite(serverTime)) {
+          return previousState
+        }
+
+        return {
+          ...previousState,
+          controllerId: String(payload.controllerId ?? previousState.controllerId),
+          controllerName: String(payload.controllerName ?? previousState.controllerName),
+          playback: {
+            status: playback.status,
+            currentTime: Math.max(0, currentTime),
+            serverTime,
+          },
         }
       })
     }
@@ -998,6 +1164,7 @@ function App() {
     socket.on('connect', handleConnect)
     socket.on('disconnect', handleDisconnect)
     socket.on('room:state', handleRoomState)
+    socket.on('playback:state', handlePlaybackState)
     socket.on('chat:message', handleChatMessage)
     socket.on('room:error', handleRoomError)
     socket.on('clock:pong', handleClockPong)
@@ -1012,12 +1179,14 @@ function App() {
       socket.off('connect', handleConnect)
       socket.off('disconnect', handleDisconnect)
       socket.off('room:state', handleRoomState)
+      socket.off('playback:state', handlePlaybackState)
       socket.off('chat:message', handleChatMessage)
       socket.off('room:error', handleRoomError)
       socket.off('clock:pong', handleClockPong)
       socket.disconnect()
+      setJoined(false)
     }
-  }, [canConnect, clientId, joinRoom, syncClock])
+  }, [canConnect, clientId, joinRoom, setNotice, syncClock])
 
   useEffect(() => {
     if (!connected) {
@@ -1032,12 +1201,17 @@ function App() {
   useEffect(() => {
     let cancelled = false
 
-    loadYouTubeApi().then(() => {
-      if (cancelled || !window.YT) {
-        return
-      }
+    loadYouTubeApi()
+      .then(() => {
+        if (cancelled) {
+          return
+        }
 
-      playerRef.current = new window.YT.Player(YOUTUBE_PLAYER_ID, {
+        if (!window.YT) {
+          throw new Error('YouTube loaded without exposing its player API.')
+        }
+
+        playerRef.current = new window.YT.Player(YOUTUBE_PLAYER_ID, {
         width: '100%',
         height: '100%',
         playerVars: {
@@ -1057,10 +1231,12 @@ function App() {
           onReady: (event) => {
             configureYouTubeIframe(event.target)
             requestBestPlaybackQuality(event.target)
+            setYoutubeApiError(null)
             setPlayerReady(true)
           },
           onStateChange: (event) => {
             const playerState = window.YT?.PlayerState
+            const state = roomStateRef.current
 
             if (event.data === playerState?.PLAYING || event.data === playerState?.BUFFERING) {
               requestBestPlaybackQuality(event.target)
@@ -1073,9 +1249,15 @@ function App() {
               setPlayerStatus('paused')
             }
 
-            if (event.data === playerState?.ENDED && roomStateRef.current?.settings?.queueAutoplay && canControlPlaybackState(roomStateRef.current, clientId)) {
-              const state = roomStateRef.current
-              socket.emit('queue:playNext', {}, (response: JoinResponse) => {
+            if (
+              event.data === playerState?.ENDED &&
+              state?.video &&
+              state.settings?.queueAutoplay &&
+              socket.connected &&
+              joinedRef.current &&
+              state.controllerId === clientId
+            ) {
+              socket.emit('queue:playNext', { autoplay: true, expectedVideoId: state.video.id }, (response: JoinResponse) => {
                 if (response?.ok && response.state) {
                   setRoomState(response.state)
                   return
@@ -1091,9 +1273,7 @@ function App() {
               return
             }
 
-            const state = roomStateRef.current
-
-            if (state?.video && playerState && canControlPlaybackState(state, clientId)) {
+            if (socket.connected && joinedRef.current && state?.video && playerState && canControlPlaybackState(state, clientId)) {
               const isPlaying = event.data === playerState.PLAYING
               const isPaused = event.data === playerState.PAUSED || event.data === playerState.CUED || event.data === playerState.ENDED
               const isTransient = event.data === playerState.BUFFERING || event.data === playerState.UNSTARTED
@@ -1124,13 +1304,21 @@ function App() {
             setPlayerError(getYouTubePlayerErrorMessage(event.data))
             setPlayerStatus('paused')
 
-            if (roomStateRef.current && canControlPlaybackState(roomStateRef.current, clientId)) {
+            if (socket.connected && joinedRef.current && roomStateRef.current && canControlPlaybackState(roomStateRef.current, clientId)) {
               socket.emit('owner:pause', { currentTime: safeCurrentTime(event.target), serverTime: serverNow() })
             }
           },
         },
+        })
       })
-    })
+      .catch((error) => {
+        if (cancelled) {
+          return
+        }
+
+        setPlayerReady(false)
+        setYoutubeApiError(error instanceof Error ? error.message : 'YouTube player could not start.')
+      })
 
     return () => {
       cancelled = true
@@ -1141,12 +1329,15 @@ function App() {
       loadedVideoIdRef.current = null
       clearQualityRetryTimers()
     }
-  }, [clearQualityRetryTimers, clientId, requestBestPlaybackQuality, serverNow])
+  }, [clearQualityRetryTimers, clientId, requestBestPlaybackQuality, serverNow, youtubeBootstrapAttempt])
 
   useEffect(() => {
-    if (roomState) {
-      applyRoomStateToPlayer(roomState)
+    if (!roomState) {
+      return
     }
+
+    const animationFrame = window.requestAnimationFrame(() => applyRoomStateToPlayer(roomState))
+    return () => window.cancelAnimationFrame(animationFrame)
   }, [applyRoomStateToPlayer, roomState])
 
   useEffect(() => {
@@ -1165,7 +1356,7 @@ function App() {
 
         setDisplayTime(nextDisplayTime)
         setSyncDriftSeconds(Math.abs(nextDisplayTime - targetTime))
-        setDuration(Number.isFinite(nextDuration) ? nextDuration : 0)
+        setDuration(state?.video && Number.isFinite(nextDuration) ? nextDuration : 0)
       }
     }, SYNC_INTERVAL_MS)
 
@@ -1246,7 +1437,7 @@ function App() {
 
     const timeoutId = window.setTimeout(() => setNotice(null), 3600)
     return () => window.clearTimeout(timeoutId)
-  }, [notice])
+  }, [notice, setNotice])
 
   useEffect(() => {
     let cancelled = false
@@ -1358,29 +1549,20 @@ function App() {
       const target = event.target
 
       if (target instanceof Node && !searchShellRef.current?.contains(target)) {
+        cancelActiveSearch()
         setSearchOpen(false)
       }
     }
 
     document.addEventListener('pointerdown', handlePointerDown)
     return () => document.removeEventListener('pointerdown', handlePointerDown)
-  }, [searchOpen])
+  }, [cancelActiveSearch, searchOpen])
 
   useEffect(() => {
     if (!chatOpen) {
       chatInputRef.current?.blur()
     }
   }, [chatOpen])
-
-  useEffect(() => {
-    if (!roomPanelOpen || isFullscreen) {
-      return
-    }
-
-    window.requestAnimationFrame(() => {
-      roomPanelRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-    })
-  }, [isFullscreen, roomPanelOpen])
 
   useEffect(() => {
     return () => {
@@ -1447,38 +1629,16 @@ function App() {
 
   useEffect(() => {
     const handleFullscreenChange = () => {
-      setIsFullscreen(document.fullscreenElement === videoShellRef.current)
+      const fullscreenActive = document.fullscreenElement === videoShellRef.current
+      setIsFullscreen(fullscreenActive)
+      if (!fullscreenActive) {
+        setFullscreenIdle(false)
+      }
     }
 
     document.addEventListener('fullscreenchange', handleFullscreenChange)
     return () => document.removeEventListener('fullscreenchange', handleFullscreenChange)
   }, [])
-
-  useEffect(() => {
-    const handleDocumentKeyDown = (event: KeyboardEvent) => {
-      const target = event.target
-      const isTyping = target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
-
-      if (event.key === 'Enter' && !isTyping) {
-        event.preventDefault()
-        setChatOpen((wasOpen) => {
-          const nextOpen = !wasOpen
-
-          if (nextOpen) {
-            setUnreadMessages(0)
-            window.requestAnimationFrame(openChatInput)
-          } else {
-            chatInputRef.current?.blur()
-          }
-
-          return nextOpen
-        })
-      }
-    }
-
-    document.addEventListener('keydown', handleDocumentKeyDown)
-    return () => document.removeEventListener('keydown', handleDocumentKeyDown)
-  }, [openChatInput])
 
   const handleSearchSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -1491,31 +1651,54 @@ function App() {
 
     if (!canControlRoom) {
       setNotice(controlUnavailableMessage)
+      cancelActiveSearch()
       setSearchOpen(false)
       return
     }
 
+    cancelActiveSearch()
+    const requestId = searchRequestIdRef.current
+    const controller = new AbortController()
+    searchAbortRef.current = controller
     const videoId = parseYouTubeVideoId(trimmedSearch)
+
+    setSearching(true)
+    setSearchOpen(true)
+    setSearchResults([])
+    setSearchError(null)
 
     if (videoId) {
       try {
-        const video = await fetchVideoMeta(videoId)
+        const video = await fetchVideoMeta(videoId, controller.signal)
+
+        if (requestId !== searchRequestIdRef.current) {
+          return
+        }
+
         loadVideo(video, { play: true })
       } catch (error) {
-        setNotice(error instanceof Error ? error.message : 'This YouTube video cannot be loaded.')
+        if (!isAbortError(error) && requestId === searchRequestIdRef.current) {
+          setNotice(error instanceof Error ? error.message : 'This YouTube video cannot be loaded.')
+        }
+      } finally {
+        if (requestId === searchRequestIdRef.current) {
+          searchAbortRef.current = null
+          setSearching(false)
+        }
       }
 
       return
     }
 
-    setSearching(true)
-    setSearchOpen(true)
-    setSearchError(null)
     setSearchAttempted(true)
 
     try {
-      const response = await fetch(apiUrl(`/api/youtube/search?query=${encodeURIComponent(trimmedSearch)}`))
+      const response = await fetch(apiUrl(`/api/youtube/search?query=${encodeURIComponent(trimmedSearch)}`), { signal: controller.signal })
       const payload = (await response.json()) as SearchResponse
+
+      if (requestId !== searchRequestIdRef.current) {
+        return
+      }
 
       if (!response.ok) {
         if (payload.code === 'YOUTUBE_API_KEY_MISSING') {
@@ -1527,10 +1710,15 @@ function App() {
 
       setSearchResults(payload.results ?? [])
     } catch (error) {
-      setSearchResults([])
-      setSearchError(error instanceof Error ? error.message : 'YouTube search failed.')
+      if (!isAbortError(error) && requestId === searchRequestIdRef.current) {
+        setSearchResults([])
+        setSearchError(error instanceof Error ? error.message : 'YouTube search failed.')
+      }
     } finally {
-      setSearching(false)
+      if (requestId === searchRequestIdRef.current) {
+        searchAbortRef.current = null
+        setSearching(false)
+      }
     }
   }
 
@@ -1818,7 +2006,7 @@ function App() {
     setNameDialogOpen(false)
     window.requestAnimationFrame(() => window.scrollTo(0, 0))
 
-    if (connected && roomStateRef.current && nextName !== previousName) {
+    if (connected && joined && roomStateRef.current && nextName !== previousName) {
       socket.emit('member:updateName', { name: nextName }, (response: JoinResponse) => {
         if (response?.ok && response.state) {
           setRoomState(response.state)
@@ -1838,7 +2026,7 @@ function App() {
   }
 
   const handleToggleTrusted = (member: RoomMember) => {
-    if (!isOwner || member.clientId === clientId) {
+    if (!canManageRoom || member.clientId === clientId) {
       return
     }
 
@@ -1853,14 +2041,18 @@ function App() {
   }
 
   const handleTransferOwnership = (member: RoomMember) => {
-    if (!isOwner || member.clientId === clientId) {
+    if (!canManageRoom || member.clientId === clientId) {
       return
     }
 
+    setConfirmationAction({ kind: 'transfer-owner', member })
+  }
+
+  const performTransferOwnership = (member: RoomMember) => {
     socket.emit('owner:transferOwnership', { clientId: member.clientId }, (response: JoinResponse) => {
       if (response?.ok && response.state) {
         setRoomState(response.state)
-        setNotice(`${member.name} is now the owner.`)
+        setNotice(`${member.name} is now the owner.`, 'success')
         return
       }
 
@@ -1890,10 +2082,14 @@ function App() {
       return
     }
 
+    setConfirmationAction({ kind: 'reset-room', scope })
+  }
+
+  const performResetRoom = (scope: 'video' | 'queue' | 'chat' | 'all') => {
     socket.emit('owner:resetRoom', { scope }, (response: JoinResponse) => {
       if (response?.ok && response.state) {
         setRoomState(response.state)
-        setNotice(scope === 'all' ? 'Room reset.' : 'Room updated.')
+        setNotice(scope === 'all' ? 'Room reset.' : 'Room updated.', 'success')
         return
       }
 
@@ -1971,10 +2167,14 @@ function App() {
       return
     }
 
+    setConfirmationAction({ kind: 'clear-queue' })
+  }
+
+  const performClearQueue = () => {
     socket.emit('queue:clear', {}, (response: JoinResponse) => {
       if (response?.ok && response.state) {
         setRoomState(response.state)
-        setNotice('Queue cleared.')
+        setNotice('Queue cleared.', 'success')
         return
       }
 
@@ -1982,7 +2182,38 @@ function App() {
     })
   }
 
+  const confirmPendingAction = () => {
+    const action = confirmationAction
+    setConfirmationAction(null)
+
+    if (!action) {
+      return
+    }
+
+    if (!roomMutationReady) {
+      setNotice('Rejoin the room before changing shared room state.')
+      return
+    }
+
+    if (action.kind === 'transfer-owner') {
+      performTransferOwnership(action.member)
+      return
+    }
+
+    if (action.kind === 'reset-room') {
+      performResetRoom(action.scope)
+      return
+    }
+
+    performClearQueue()
+  }
+
   const handleReactToMessage = (message: ChatMessage, emoji: string) => {
+    if (!roomMutationReady) {
+      setNotice('Rejoin the room before reacting.')
+      return
+    }
+
     socket.emit('chat:react', { messageId: message.id, emoji }, (response: JoinResponse) => {
       if (response?.ok && response.state) {
         setRoomState(response.state)
@@ -1994,6 +2225,11 @@ function App() {
   }
 
   const handleDeleteMessage = (message: ChatMessage) => {
+    if (!roomMutationReady) {
+      setNotice('Rejoin the room before deleting messages.')
+      return
+    }
+
     if (message.clientId !== clientId && !isOwner) {
       return
     }
@@ -2017,7 +2253,14 @@ function App() {
 
     setPlaybackRate(playerRef.current, 1)
     applyRoomStateToPlayer(state)
-    setNotice(controllerName ? `Synced to ${controllerName}.` : 'Synced to the room.')
+    setNotice(controllerName ? `Synced to ${controllerName}.` : 'Synced to the room.', 'success')
+  }
+
+  const handleRetryYouTubePlayer = () => {
+    youtubeApiPromise = null
+    setYoutubeApiError(null)
+    setPlayerError(null)
+    setYoutubeBootstrapAttempt((attempt) => attempt + 1)
   }
 
   const handleToggleFullscreen = async () => {
@@ -2093,6 +2336,10 @@ function App() {
   const handleChatSubmit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
 
+    if (chatSending) {
+      return
+    }
+
     const body = resolveEmojiShortcodes(chatDraft).trim()
 
     if (!body && !pendingImage) {
@@ -2100,17 +2347,58 @@ function App() {
       chatInputRef.current?.blur()
       return
     }
-    socket.emit('chat:send', { body, image: pendingImage })
-    setChatDraft('')
-    setPendingImage(null)
-    setChatOpen(false)
-    chatInputRef.current?.blur()
+
+    if (!socket.connected || !joinedRef.current) {
+      setChatOpen(true)
+      setNotice('Rejoin the room before sending. Your message is still here.')
+      window.requestAnimationFrame(() => chatInputRef.current?.focus({ preventScroll: true }))
+      return
+    }
+
+    const attemptId = chatSendAttemptRef.current + 1
+    chatSendAttemptRef.current = attemptId
+    setChatSending(true)
+
+    const finishSend = (response: ActionResponse | null) => {
+      if (attemptId !== chatSendAttemptRef.current) {
+        return
+      }
+
+      chatSendAttemptRef.current = attemptId + 1
+
+      if (chatSendTimeoutRef.current !== null) {
+        window.clearTimeout(chatSendTimeoutRef.current)
+        chatSendTimeoutRef.current = null
+      }
+
+      setChatSending(false)
+
+      if (!response?.ok) {
+        setNotice(response?.message ?? 'Message was not confirmed. Your draft was kept.')
+        window.requestAnimationFrame(() => chatInputRef.current?.focus({ preventScroll: true }))
+        return
+      }
+
+      setChatDraft('')
+      setPendingImage(null)
+      setChatOpen(false)
+      chatInputRef.current?.blur()
+    }
+
+    chatSendTimeoutRef.current = window.setTimeout(() => finishSend(null), CHAT_SEND_TIMEOUT_MS)
+    socket.emit('chat:send', { body, image: pendingImage }, (response: ActionResponse) => finishSend(response))
   }
 
   const handleChatInputKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'Escape') {
       setChatOpen(false)
       chatInputRef.current?.blur()
+      return
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      event.currentTarget.form?.requestSubmit()
       return
     }
 
@@ -2135,24 +2423,36 @@ function App() {
     event.currentTarget.style.setProperty('--glass-light-opacity', '0')
   }
 
-  const stopImageLightboxEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
-    event.preventDefault()
+  const stopImageLightboxEvent = (event: ReactSyntheticEvent) => {
     event.stopPropagation()
   }
 
-  const handleImageLightboxBackdropEvent = (event: ReactMouseEvent<HTMLDivElement> | ReactPointerEvent<HTMLDivElement> | ReactTouchEvent<HTMLDivElement>) => {
-    event.preventDefault()
-    event.stopPropagation()
+  const openImagePreview = (image: ChatImage, author: string) => {
+    previewReturnFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    setPreviewImage({ image, author })
   }
+
+  const closeImagePreview = useCallback(() => {
+    const returnFocus = previewReturnFocusRef.current
+    setPreviewImage(null)
+    previewReturnFocusRef.current = null
+    window.requestAnimationFrame(() => returnFocus?.focus({ preventScroll: true }))
+  }, [])
 
   const handleImageLightboxBackdropClick = (event: ReactMouseEvent<HTMLDivElement>) => {
-    event.preventDefault()
     event.stopPropagation()
 
     if (event.target === event.currentTarget) {
-      setPreviewImage(null)
+      closeImagePreview()
     }
   }
+
+  const closeRoomPanel = useCallback((restoreFocus = true) => {
+    setRoomPanelOpen(false)
+    if (restoreFocus) {
+      window.requestAnimationFrame(() => roomPanelButtonRef.current?.focus({ preventScroll: true }))
+    }
+  }, [])
 
   const handleTimelinePreviewImageError = (event: ReactSyntheticEvent<HTMLImageElement>) => {
     const image = event.currentTarget
@@ -2169,15 +2469,61 @@ function App() {
   }
 
   useEffect(() => {
+    if (!previewImage) {
+      return
+    }
+
+    const previousOverflow = document.body.style.overflow
+    document.body.style.overflow = 'hidden'
+    const animationFrame = window.requestAnimationFrame(() => previewCloseButtonRef.current?.focus({ preventScroll: true }))
+
+    return () => {
+      document.body.style.overflow = previousOverflow
+      window.cancelAnimationFrame(animationFrame)
+    }
+  }, [previewImage])
+
+  useEffect(() => {
     const handleDocumentKeyDown = (event: KeyboardEvent) => {
       const target = event.target
-      const isTyping = target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))
+      const isInteractive = isKeyboardInteractiveTarget(target)
 
-      if (isTyping || nameDialogOpen || previewImage) {
+      if (event.key === 'Escape') {
+        if (confirmationAction) {
+          event.preventDefault()
+          setConfirmationAction(null)
+        } else if (previewImage) {
+          event.preventDefault()
+          closeImagePreview()
+        } else if (searchOpen) {
+          event.preventDefault()
+          cancelActiveSearch()
+          setSearchOpen(false)
+        } else if (chatOpen) {
+          event.preventDefault()
+          closeChatInput()
+        } else if (roomPanelOpen) {
+          event.preventDefault()
+          closeRoomPanel()
+        } else if (nameDialogOpen && displayName) {
+          event.preventDefault()
+          setNameDialogOpen(false)
+        }
         return
       }
 
-      if (event.key === ' ' || event.key.toLowerCase() === 'k') {
+      if (isInteractive || nameDialogOpen || previewImage || confirmationAction) {
+        return
+      }
+
+      if (event.key === 'Enter') {
+        event.preventDefault()
+        if (chatOpen) {
+          closeChatInput()
+        } else {
+          openChatInput()
+        }
+      } else if (event.key === ' ' || event.key.toLowerCase() === 'k') {
         event.preventDefault()
         handleTogglePlayback()
       } else if (event.key.toLowerCase() === 'f') {
@@ -2191,7 +2537,11 @@ function App() {
         handleResync()
       } else if (event.key.toLowerCase() === 'q') {
         event.preventDefault()
-        setRoomPanelOpen((open) => !open)
+        if (roomPanelOpen) {
+          closeRoomPanel()
+        } else {
+          setRoomPanelOpen(true)
+        }
       }
     }
 
@@ -2228,13 +2578,15 @@ function App() {
           <input
             value={searchText}
             onChange={(event) => {
+              cancelActiveSearch()
               setSearchText(event.currentTarget.value)
               setSearchAttempted(false)
               setSearchError(null)
             }}
             onFocus={() => setSearchOpen(true)}
-            placeholder={canControlRoom ? 'Search YouTube or paste a link' : 'Ask the host to trust you for controls'}
+            placeholder={!roomMutationReady ? `${connectionLabel} to room…` : canControlRoom ? 'Search YouTube or paste a link' : 'Ask the host to trust you for controls'}
             aria-label="Search YouTube or paste a link"
+            aria-busy={searching}
             enterKeyHint="search"
             autoComplete="off"
           />
@@ -2243,7 +2595,7 @@ function App() {
           </button>
 
           {showSearchPanel && (
-            <div className="search-panel">
+            <div className="search-panel" role="region" aria-label="YouTube search results" aria-live="polite">
               {searching && <div className="search-message">Searching YouTube...</div>}
               {searchError && <div className="search-message is-error">{searchError}</div>}
               {!searching && !searchError && searchAttempted && searchResults.length === 0 && <div className="search-message">No videos found.</div>}
@@ -2276,29 +2628,35 @@ function App() {
         </form>
 
         <div className="room-tools">
-          <button className="room-pill room-button name-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleEditName} title="Change username">
+          <button className="room-pill room-button name-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleEditName} title="Change username" aria-label={`Change username. Signed in as ${displayName || 'unnamed'}, ${roleLabel}`}>
             <Users size={15} aria-hidden="true" />
-            <span className="room-pill-label">{displayName || 'Name'}</span>
-          </button>
-          <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title={isOwner ? 'Owner' : currentMember?.trusted ? 'Trusted controller' : `Owner: ${roomState?.ownerName ?? 'joining'}`}>
-            {isOwner ? <Crown size={15} aria-hidden="true" /> : currentMember?.trusted ? <ShieldCheck size={15} aria-hidden="true" /> : <Lock size={15} aria-hidden="true" />}
-            <span className="room-pill-label">{roleLabel}</span>
-          </span>
-          {trustedCount > 0 && (
-            <span className="room-pill trusted-count-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title="Trusted viewers">
-              <UserCheck size={15} aria-hidden="true" />
-              {trustedCount}
+            <span className="room-identity-copy">
+              <strong className="room-pill-label">{displayName || 'Name'}</strong>
+              <small>{roleLabel}</small>
             </span>
-          )}
-          <span className="room-pill" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} title="Connected viewers">
-            <Users size={15} aria-hidden="true" />
-            {memberCount}
-          </span>
-          <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={() => setRoomPanelOpen((open) => !open)} title="Room panel">
-            <PanelRightOpen size={15} aria-hidden="true" />
-            <span className="room-pill-label">{queueCount}</span>
           </button>
-          <button className="room-pill room-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleCopyLink} title="Copy room link">
+          <span className={`room-pill connection-pill is-${connectionPhase}`} role="status" aria-live="polite" title={`Room connection: ${connectionLabel}`}>
+            {connectionPhase === 'live' ? <Wifi size={15} aria-hidden="true" /> : connectionPhase === 'offline' ? <WifiOff size={15} aria-hidden="true" /> : <LoaderCircle size={15} className="spin" aria-hidden="true" />}
+            <span className="room-pill-label">{connectionLabel}</span>
+          </span>
+          <button
+            className={`room-pill room-button room-overview-button ${roomPanelOpen ? 'is-active' : ''}`}
+            ref={roomPanelButtonRef}
+            type="button"
+            onPointerEnter={handleGlassPointerMove}
+            onPointerMove={handleGlassPointerMove}
+            onPointerLeave={handleGlassPointerLeave}
+            onClick={() => roomPanelOpen ? closeRoomPanel(false) : setRoomPanelOpen(true)}
+            title={`${memberCount} watching, ${queueCount} queued, ${trustedCount} trusted`}
+            aria-label={`${roomPanelOpen ? 'Close' : 'Open'} room panel. ${memberCount} watching and ${queueCount} queued.`}
+            aria-expanded={roomPanelOpen}
+            aria-controls="room-panel"
+          >
+            <PanelRightOpen size={15} aria-hidden="true" />
+            <span className="room-overview-stat"><Users size={13} aria-hidden="true" /><strong>{memberCount}</strong><span>watching</span></span>
+            <span className="room-overview-stat"><ListPlus size={13} aria-hidden="true" /><strong>{queueCount}</strong><span>queued</span></span>
+          </button>
+          <button className="room-pill room-button room-copy-button" type="button" onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onClick={handleCopyLink} title="Copy room link" aria-label={`Copy link to room ${roomId}`}>
             {copied ? <Check size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
             <span className="room-pill-label">{copied ? 'Copied' : roomId}</span>
           </button>
@@ -2307,7 +2665,7 @@ function App() {
 
       <main className="watch-layout">
         <section className="stage-section" aria-label="Watch room">
-          <div className={`video-shell ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef} style={miniPlayerActive ? miniPlayerStyle : undefined}>
+          <div className={`video-shell ${currentVideo ? 'has-video' : 'is-empty'} ${isFullscreen ? 'is-fullscreen' : ''} ${miniPlayerActive ? 'is-mini' : ''} ${chatOpen ? 'is-chat-open' : ''} ${fullscreenIdle ? 'is-idle' : ''}`} ref={videoShellRef} style={miniPlayerActive ? miniPlayerStyle : undefined}>
             <div
               className={`player-surface ${currentVideo ? 'has-video' : ''} ${canControlRoom ? 'can-control' : 'is-viewer'}`}
               onPointerDown={handleVideoSurfacePointerDown}
@@ -2328,12 +2686,20 @@ function App() {
                   </button>
                 </div>
               )}
-              {currentVideo && !playerReady && (
+              {currentVideo && !playerReady && !youtubeApiError && (
                 <div className="player-loading">
                   <LoaderCircle size={24} className="spin" aria-hidden="true" />
                 </div>
               )}
-              {currentVideo && (effectiveStatus !== 'playing' || playerError) && (
+              {youtubeApiError && (
+                <div className="player-bootstrap-error" role="alert" onClick={(event) => event.stopPropagation()}>
+                  <WifiOff size={24} aria-hidden="true" />
+                  <strong>Player unavailable</strong>
+                  <span>{youtubeApiError}</span>
+                  <button type="button" onClick={handleRetryYouTubePlayer}>Retry player</button>
+                </div>
+              )}
+              {currentVideo && !youtubeApiError && (effectiveStatus !== 'playing' || playerError) && (
                 <div className="player-overlay">
                   <img src={currentVideo.thumbnail} alt="" />
                   <div className="player-overlay-shade" />
@@ -2428,7 +2794,7 @@ function App() {
                   aria-valuetext={`${formatTime(displayTime)} of ${formatTime(timelineMax)}`}
                 />
               </div>
-              <span className="time-code">{formatTime(timelineMax)}</span>
+              <span className="time-code">{formatTime(timelineDuration)}</span>
 
               <div className="volume-control" style={{ '--volume-level': `${audibleVolume}%` } as CSSProperties}>
                 <button
@@ -2519,13 +2885,13 @@ function App() {
                       <time dateTime={new Date(message.createdAt).toISOString()}>{formatMessageTime(message.createdAt)}</time>
                       <span className="chat-author">{messageIsOwn ? 'You' : message.name}</span>
                       {(messageIsOwn || isOwner) && (
-                        <button className="chat-delete-button" type="button" onClick={() => handleDeleteMessage(message)} title="Delete message" aria-label="Delete message">
+                        <button className="chat-delete-button" type="button" onClick={() => handleDeleteMessage(message)} disabled={!roomMutationReady} title="Delete message" aria-label="Delete message">
                           <Trash2 size={11} aria-hidden="true" />
                         </button>
                       )}
                     </span>
                     {message.image && (
-                      <button className="chat-image-button" type="button" onClick={() => setPreviewImage({ image: message.image as ChatImage, author: messageIsOwn ? 'You' : message.name })} aria-label="Open shared image">
+                      <button className="chat-image-button" type="button" onClick={() => openImagePreview(message.image as ChatImage, messageIsOwn ? 'You' : message.name)} aria-label={`Open image shared by ${messageIsOwn ? 'you' : message.name}`}>
                         <img src={message.image.dataUrl} alt={message.image.name || 'Shared image'} />
                       </button>
                     )}
@@ -2536,6 +2902,7 @@ function App() {
                           key={reaction.emoji}
                           type="button"
                           onClick={() => handleReactToMessage(message, reaction.emoji)}
+                          disabled={!roomMutationReady}
                           aria-label={`React ${reaction.emoji}`}
                         >
                           <span>{reaction.emoji}</span>
@@ -2545,7 +2912,7 @@ function App() {
                       {CHAT_REACTION_OPTIONS.filter((emoji) => !(message.reactions ?? []).some((reaction) => reaction.emoji === emoji))
                         .slice(0, 3)
                         .map((emoji) => (
-                          <button className="chat-reaction is-suggested" key={emoji} type="button" onClick={() => handleReactToMessage(message, emoji)} aria-label={`React ${emoji}`}>
+                          <button className="chat-reaction is-suggested" key={emoji} type="button" onClick={() => handleReactToMessage(message, emoji)} disabled={!roomMutationReady} aria-label={`React ${emoji}`}>
                             {emoji}
                           </button>
                         ))}
@@ -2555,12 +2922,12 @@ function App() {
               })}
             </div>
 
-            <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''} ${pendingImage ? 'has-attachment' : ''}`} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
+            <form className={`chat-composer ${chatOpen ? 'is-open' : ''} ${emojiSuggestions.length > 0 ? 'has-emoji-suggestions' : ''} ${pendingImage ? 'has-attachment' : ''} ${chatSending ? 'is-sending' : ''}`} aria-busy={chatSending} onPointerEnter={handleGlassPointerMove} onPointerMove={handleGlassPointerMove} onPointerLeave={handleGlassPointerLeave} onSubmit={handleChatSubmit}>
               {pendingImage && (
                 <div className="pending-attachment">
                   <img src={pendingImage.dataUrl} alt={pendingImage.name || 'Image attachment'} />
                   <span>{pendingImage.name || 'Image'}</span>
-                  <button className="pending-remove" type="button" onClick={() => setPendingImage(null)} title="Remove image" aria-label="Remove image">
+                  <button className="pending-remove" type="button" onClick={() => setPendingImage(null)} disabled={chatSending} title="Remove image" aria-label="Remove image">
                     <X size={14} aria-hidden="true" />
                   </button>
                 </div>
@@ -2577,9 +2944,10 @@ function App() {
                 enterKeyHint="send"
                 autoCapitalize="sentences"
                 maxLength={400}
+                disabled={chatSending}
               />
               <input ref={imageInputRef} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={handleImageFileChange} />
-              <button className="icon-button attachment-button" type="button" onClick={handleOpenImagePicker} disabled={uploadingImage} title="Attach image" aria-label="Attach image">
+              <button className="icon-button attachment-button" type="button" onClick={handleOpenImagePicker} disabled={uploadingImage || chatSending} title="Attach image" aria-label="Attach image">
                 {uploadingImage ? <LoaderCircle size={17} className="spin" aria-hidden="true" /> : <ImageIcon size={17} aria-hidden="true" />}
               </button>
               {emojiSuggestions.length > 0 && (
@@ -2591,6 +2959,7 @@ function App() {
                       type="button"
                       onMouseDown={(event) => event.preventDefault()}
                       onClick={() => applyEmojiSuggestion(option)}
+                      disabled={chatSending}
                       role="option"
                       title={`:${option.name}:`}
                       aria-label={`Use :${option.name}:`}
@@ -2600,8 +2969,8 @@ function App() {
                   ))}
                 </div>
               )}
-              <button className="icon-button send-button" type="submit" disabled={uploadingImage} title="Send" aria-label="Send message">
-                <Send size={17} aria-hidden="true" />
+              <button className="icon-button send-button" type="submit" disabled={uploadingImage || chatSending} title={chatSending ? 'Sending' : 'Send'} aria-label={chatSending ? 'Sending message' : 'Send message'}>
+                {chatSending ? <LoaderCircle size={17} className="spin" aria-hidden="true" /> : <Send size={17} aria-hidden="true" />}
               </button>
             </form>
 
@@ -2610,24 +2979,23 @@ function App() {
                 className="image-lightbox"
                 role="dialog"
                 aria-modal="true"
-                aria-label="Shared image preview"
-                onPointerDown={handleImageLightboxBackdropEvent}
-                onMouseDown={handleImageLightboxBackdropEvent}
-                onTouchStart={handleImageLightboxBackdropEvent}
-                onPointerUp={stopImageLightboxEvent}
-                onMouseUp={stopImageLightboxEvent}
+                aria-labelledby="image-preview-title"
+                onPointerDown={stopImageLightboxEvent}
                 onClick={handleImageLightboxBackdropClick}
               >
                 <div
                   className="image-lightbox-content"
                   onPointerDown={stopImageLightboxEvent}
-                  onMouseDown={stopImageLightboxEvent}
-                  onTouchStart={stopImageLightboxEvent}
-                  onPointerUp={stopImageLightboxEvent}
-                  onMouseUp={stopImageLightboxEvent}
                   onClick={stopImageLightboxEvent}
                 >
+                  <button ref={previewCloseButtonRef} className="image-lightbox-close" type="button" onClick={closeImagePreview} aria-label="Close image preview">
+                    <X size={18} aria-hidden="true" />
+                  </button>
                   <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
+                  <div className="image-lightbox-caption" id="image-preview-title">
+                    <strong>Shared by {previewImage.author}</strong>
+                    {previewImage.image.name && <span>{previewImage.image.name}</span>}
+                  </div>
                 </div>
               </div>
             )}
@@ -2638,19 +3006,19 @@ function App() {
             <div className="now-copy">
               <p className="eyebrow">Room {roomId}</p>
               <h2>{currentVideo?.title ?? 'YouWatch'}</h2>
-              <p>{currentVideo?.author ?? (connected ? `Joined as ${displayName}` : 'Connecting...')}</p>
+              <p>{currentVideo?.author ?? (joined ? `Joined as ${displayName}` : `${connectionLabel} · ${displayName || 'Choose a name'}`)}</p>
             </div>
             <div className="member-strip" aria-label="Room members">
               {roomState?.members.map((member) => (
                 <button
-                  className={`member-avatar ${member.trusted ? 'is-trusted' : ''} ${member.clientId === roomState.ownerId ? 'is-owner' : ''} ${isOwner && member.clientId !== clientId ? 'can-toggle' : ''}`}
+                  className={`member-avatar ${member.trusted ? 'is-trusted' : ''} ${member.clientId === roomState.ownerId ? 'is-owner' : ''} ${canManageRoom && member.clientId !== clientId ? 'can-toggle' : ''}`}
                   key={member.clientId}
                   type="button"
                   style={{ '--member-color': member.color } as CSSProperties}
                   onClick={() => handleToggleTrusted(member)}
-                  disabled={!isOwner || member.clientId === clientId}
-                  title={getMemberTitle(member, roomState.ownerId, isOwner && member.clientId !== clientId)}
-                  aria-label={getMemberTitle(member, roomState.ownerId, isOwner && member.clientId !== clientId)}
+                  disabled={!canManageRoom || member.clientId === clientId}
+                  title={getMemberTitle(member, roomState.ownerId, canManageRoom && member.clientId !== clientId)}
+                  aria-label={getMemberTitle(member, roomState.ownerId, canManageRoom && member.clientId !== clientId)}
                 >
                   <span className="member-initial">{member.name.slice(0, 1).toUpperCase()}</span>
                   {member.clientId === roomState.ownerId ? <Crown className="member-role-icon" size={11} aria-hidden="true" /> : member.trusted ? <ShieldCheck className="member-role-icon" size={11} aria-hidden="true" /> : null}
@@ -2660,11 +3028,11 @@ function App() {
           </div>
 
           {roomPanelOpen && (
-            <aside className="room-panel" ref={roomPanelRef} aria-label="Room panel">
+            <aside className="room-panel" id="room-panel" ref={roomPanelRef} aria-labelledby="room-panel-title">
               <div className="room-panel-header">
                 <div>
                   <p className="eyebrow">Queue</p>
-                  <h2>{queueCount > 0 ? `${queueCount} upcoming` : 'No queued videos'}</h2>
+                  <h2 id="room-panel-title">{queueCount > 0 ? `${queueCount} upcoming` : 'No queued videos'}</h2>
                 </div>
                 <div className="room-panel-actions">
                   <button className="icon-button" type="button" onClick={handlePlayNextQueuedItem} disabled={!canManageQueue || queueCount === 0} title="Play next queued video" aria-label="Play next queued video">
@@ -2672,6 +3040,9 @@ function App() {
                   </button>
                   <button className="icon-button" type="button" onClick={handleClearQueue} disabled={!canManageQueue || queueCount === 0} title="Clear queue" aria-label="Clear queue">
                     <Trash2 size={16} aria-hidden="true" />
+                  </button>
+                  <button className="icon-button room-panel-close" type="button" onClick={() => closeRoomPanel()} title="Close room panel" aria-label="Close room panel">
+                    <X size={16} aria-hidden="true" />
                   </button>
                 </div>
               </div>
@@ -2749,7 +3120,7 @@ function App() {
                           <strong>{member.clientId === clientId ? 'You' : member.name}</strong>
                           <small>{member.clientId === roomState.ownerId ? 'Owner' : member.trusted ? 'Trusted controller' : 'Viewer'}</small>
                         </span>
-                        {isOwner && member.clientId !== clientId && (
+                        {canManageRoom && member.clientId !== clientId && (
                           <span className="member-row-actions">
                             <button type="button" onClick={() => handleToggleTrusted(member)}>{member.trusted ? 'Untrust' : 'Trust'}</button>
                             <button type="button" onClick={() => handleTransferOwnership(member)}>Owner</button>
@@ -2789,24 +3160,23 @@ function App() {
           className="image-lightbox"
           role="dialog"
           aria-modal="true"
-          aria-label="Shared image preview"
-          onPointerDown={handleImageLightboxBackdropEvent}
-          onMouseDown={handleImageLightboxBackdropEvent}
-          onTouchStart={handleImageLightboxBackdropEvent}
-          onPointerUp={stopImageLightboxEvent}
-          onMouseUp={stopImageLightboxEvent}
+          aria-labelledby="image-preview-title"
+          onPointerDown={stopImageLightboxEvent}
           onClick={handleImageLightboxBackdropClick}
         >
           <div
             className="image-lightbox-content"
             onPointerDown={stopImageLightboxEvent}
-            onMouseDown={stopImageLightboxEvent}
-            onTouchStart={stopImageLightboxEvent}
-            onPointerUp={stopImageLightboxEvent}
-            onMouseUp={stopImageLightboxEvent}
             onClick={stopImageLightboxEvent}
           >
+            <button ref={previewCloseButtonRef} className="image-lightbox-close" type="button" onClick={closeImagePreview} aria-label="Close image preview">
+              <X size={18} aria-hidden="true" />
+            </button>
             <img src={previewImage.image.dataUrl} alt={previewImage.image.name || 'Shared image'} />
+            <div className="image-lightbox-caption" id="image-preview-title">
+              <strong>Shared by {previewImage.author}</strong>
+              {previewImage.image.name && <span>{previewImage.image.name}</span>}
+            </div>
           </div>
         </div>
       )}
@@ -2834,7 +3204,23 @@ function App() {
         </div>
       )}
 
-      {notice && <div className="notice">{notice}</div>}
+      {confirmationAction && confirmationCopy && (
+        <div className="confirmation-gate" role="alertdialog" aria-modal="true" aria-labelledby="confirmation-title" aria-describedby="confirmation-description" onClick={() => setConfirmationAction(null)}>
+          <div className="confirmation-card" onClick={(event) => event.stopPropagation()}>
+            <span className="confirmation-icon"><Trash2 size={20} aria-hidden="true" /></span>
+            <div>
+              <h2 id="confirmation-title">{confirmationCopy.title}</h2>
+              <p id="confirmation-description">{confirmationCopy.description}</p>
+            </div>
+            <div className="confirmation-actions">
+              <button type="button" onClick={() => setConfirmationAction(null)} autoFocus>Cancel</button>
+              <button className="is-danger" type="button" onClick={confirmPendingAction}>{confirmationCopy.confirmLabel}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {notice && <div className={`notice is-${notice.tone}`} role={notice.tone === 'error' ? 'alert' : 'status'}>{notice.message}</div>}
     </div>
   )
 }
@@ -2940,20 +3326,64 @@ function loadYouTubeApi() {
   }
 
   if (!youtubeApiPromise) {
-    youtubeApiPromise = new Promise((resolve) => {
+    youtubeApiPromise = new Promise<void>((resolve, reject) => {
       const previousCallback = window.onYouTubeIframeAPIReady
+      const existingScript = document.querySelector<HTMLScriptElement>('script[src="https://www.youtube.com/iframe_api"]')
+      const script = existingScript ?? document.createElement('script')
+      let settled = false
+      let timeoutId = 0
 
-      window.onYouTubeIframeAPIReady = () => {
+      const cleanup = () => {
+        window.clearTimeout(timeoutId)
+        script.removeEventListener('error', handleScriptError)
+        if (window.onYouTubeIframeAPIReady === handleReady) {
+          window.onYouTubeIframeAPIReady = previousCallback
+        }
+      }
+
+      const fail = (message: string) => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        cleanup()
+        if (!window.YT?.Player) {
+          script.remove()
+        }
+        reject(new Error(message))
+      }
+
+      const handleReady = () => {
+        if (settled) {
+          return
+        }
+
+        settled = true
+        cleanup()
         previousCallback?.()
         resolve()
       }
 
-      if (!document.querySelector('script[src="https://www.youtube.com/iframe_api"]')) {
-        const script = document.createElement('script')
+      function handleScriptError() {
+        fail('YouTube player could not load. Check your connection or content blocker, then retry.')
+      }
+
+      window.onYouTubeIframeAPIReady = handleReady
+      script.addEventListener('error', handleScriptError, { once: true })
+      timeoutId = window.setTimeout(
+        () => fail('YouTube player timed out. Check your connection or content blocker, then retry.'),
+        YOUTUBE_API_TIMEOUT_MS,
+      )
+
+      if (!existingScript) {
         script.src = 'https://www.youtube.com/iframe_api'
         script.async = true
         document.head.appendChild(script)
       }
+    }).catch((error) => {
+      youtubeApiPromise = null
+      throw error
     })
   }
 
@@ -3104,13 +3534,17 @@ function getTimelinePreviewThumbnailSources(video?: VideoMeta | null) {
   )
 }
 
-async function fetchVideoMeta(videoId: string): Promise<VideoMeta> {
+async function fetchVideoMeta(videoId: string, signal?: AbortSignal): Promise<VideoMeta> {
   let response: Response
 
   try {
-    response = await fetch(apiUrl(`/api/youtube/video?videoId=${encodeURIComponent(videoId)}`))
-  } catch {
-    return fetchOembedVideoMeta(videoId)
+    response = await fetch(apiUrl(`/api/youtube/video?videoId=${encodeURIComponent(videoId)}`), { signal })
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
+
+    return fetchOembedVideoMeta(videoId, signal)
   }
 
   const payload = (await response.json()) as { video?: VideoMeta; message?: string }
@@ -3120,14 +3554,14 @@ async function fetchVideoMeta(videoId: string): Promise<VideoMeta> {
   }
 
   if (response.status === 502 || response.status === 503) {
-    return fetchOembedVideoMeta(videoId)
+    return fetchOembedVideoMeta(videoId, signal)
   }
 
   throw new Error(payload.message ?? 'This YouTube video cannot be loaded.')
 }
 
-async function fetchOembedVideoMeta(videoId: string): Promise<VideoMeta> {
-  const response = await fetch(apiUrl(`/api/youtube/oembed?videoId=${encodeURIComponent(videoId)}`))
+async function fetchOembedVideoMeta(videoId: string, signal?: AbortSignal): Promise<VideoMeta> {
+  const response = await fetch(apiUrl(`/api/youtube/oembed?videoId=${encodeURIComponent(videoId)}`), { signal })
   const payload = (await response.json()) as { video?: VideoMeta; message?: string }
 
   if (response.ok && payload.video) {
@@ -3135,6 +3569,10 @@ async function fetchOembedVideoMeta(videoId: string): Promise<VideoMeta> {
   }
 
   throw new Error(payload.message ?? 'This YouTube video cannot be loaded.')
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof DOMException && error.name === 'AbortError'
 }
 
 async function fetchVideoStoryboard(videoId: string): Promise<VideoStoryboard> {
@@ -3400,6 +3838,20 @@ function getClientId() {
   return clientId
 }
 
+function getSessionToken() {
+  const storedToken = readLocalStorage(SESSION_TOKEN_KEY)
+
+  if (/^[a-zA-Z0-9_-]{32,128}$/.test(storedToken)) {
+    return storedToken
+  }
+
+  const token = typeof globalThis.crypto?.randomUUID === 'function'
+    ? `${globalThis.crypto.randomUUID()}-${randomToken(20)}`
+    : `session-${randomToken(56)}`
+  writeLocalStorage(SESSION_TOKEN_KEY, token)
+  return token
+}
+
 function getStoredDisplayName() {
   const storedName = normalizeDisplayName(readLocalStorage(LOCAL_NAME_KEY))
   const confirmed = readLocalStorage(LOCAL_NAME_CONFIRMED_KEY) === '1'
@@ -3517,6 +3969,45 @@ function getControlUnavailableMessage(state: RoomState | null) {
 
   const ownerName = state?.ownerName?.trim()
   return ownerName ? `Only ${ownerName} and trusted viewers can control playback.` : 'Only the host and trusted viewers can control playback.'
+}
+
+function getConfirmationCopy(action: ConfirmationAction | null) {
+  if (!action) {
+    return null
+  }
+
+  if (action.kind === 'transfer-owner') {
+    return {
+      title: `Make ${action.member.name} the owner?`,
+      description: 'You will immediately lose owner-only room controls. The new owner can hand control back later.',
+      confirmLabel: 'Transfer ownership',
+    }
+  }
+
+  if (action.kind === 'clear-queue') {
+    return {
+      title: 'Clear the entire queue?',
+      description: 'Every upcoming video will be removed for everyone in the room.',
+      confirmLabel: 'Clear queue',
+    }
+  }
+
+  const scopeLabel = action.scope === 'all' ? 'the entire room' : action.scope === 'video' ? 'the current video' : `the ${action.scope}`
+  return {
+    title: `Reset ${scopeLabel}?`,
+    description: action.scope === 'all'
+      ? 'This clears the video, queue, chat, history, and restores default room settings.'
+      : `This clears ${scopeLabel} for everyone in the room.`,
+    confirmLabel: action.scope === 'all' ? 'Reset room' : 'Confirm reset',
+  }
+}
+
+function isKeyboardInteractiveTarget(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false
+  }
+
+  return target.isContentEditable || Boolean(target.closest('button, a, input, textarea, select, summary, [role="button"], [role="option"], [role="menuitem"], [role="dialog"]'))
 }
 
 function canControlPlaybackState(state: RoomState, clientId: string) {

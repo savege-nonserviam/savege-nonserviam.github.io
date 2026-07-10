@@ -38,11 +38,11 @@ npm test
 npm run build
 ```
 
-The test suite uses Node's built-in test runner for server validation and serialization behavior.
+The test suite uses Node's built-in test runner for validation plus realtime Socket.IO regressions covering private room sessions, multi-tab reconnects, lightweight playback updates, idempotent queue autoplay, and acknowledged chat delivery.
 
 ## Empty Rooms
 
-Active sockets, chat messages, ownership timers, and cleanup timers are stored in memory. When the last connected viewer leaves, the in-memory room is deleted immediately and chat is discarded.
+Active sockets, chat messages, ownership timers, and cleanup timers are stored in memory. When the last connected viewer leaves, the server keeps the in-memory room for a 45-second reconnect grace period. Rejoining during that window preserves chat and ownership; after the grace expires, chat is discarded.
 
 By default, the server also persists non-chat room state to `data/rooms.json`: current video, playback position, room settings, queue, and recently played history. This lets a later visit to the same room hash restore the watch plan without storing chat. Disable this behavior with:
 
@@ -50,7 +50,9 @@ By default, the server also persists non-chat room state to `data/rooms.json`: c
 ROOM_PERSISTENCE=0
 ```
 
-Use `ROOM_PERSISTENCE_FILE=/absolute/path/rooms.json` if the host needs the persistence file outside the project folder.
+Use `ROOM_PERSISTENCE_FILE=/absolute/path/rooms.json` if the host needs the persistence file outside the project folder. Writes use a same-directory temporary file and atomic rename. Snapshots are pruned after 30 days and capped at 500 rooms by default; tune `ROOM_SNAPSHOT_TTL_MS` and `MAX_PERSISTED_ROOMS` when needed.
+
+The server is intentionally single-instance: active Socket.IO rooms are in memory and persisted room snapshots use one local JSON file. Do not scale this service to multiple replicas without moving realtime coordination and persistence to shared storage.
 
 ## Put This In GitHub
 
@@ -107,9 +109,10 @@ Healthcheck path: /api/health
 ```text
 YOUTUBE_API_KEY=your_youtube_data_api_key
 ROOM_PERSISTENCE=1
+TRUST_PROXY_HOPS=1
 ```
 
-Railway automatically provides `PORT`, so do not set `PORT` in Railway unless you have a special reason. Leave `CORS_ORIGIN` empty when Railway serves the website and server from the same domain. Set `CORS_ORIGIN` only if you host the frontend somewhere else, for example:
+Railway automatically provides `PORT`, so do not set `PORT` in Railway unless you have a special reason. `TRUST_PROXY_HOPS=1` lets request and room-creation limits use the real client IP behind Railway's proxy; leave it at `0` for a directly exposed local server. Leave `CORS_ORIGIN` empty when Railway serves the website and server from the same domain. Set `CORS_ORIGIN` only if you host the frontend somewhere else, for example:
 
 ```text
 CORS_ORIGIN=https://your-frontend-domain.com
@@ -123,7 +126,7 @@ YouTube URL loading can still fall back to oEmbed without a key, but YouTube sea
 
 Railway is the easiest place to host the whole app. If you also want `https://savege-nonserviam.github.io/` to show the app, GitHub Pages must deploy the built `dist` folder, not the raw source files. Serving the repository root directly makes the browser request `/src/main.tsx`, which GitHub Pages serves as `application/octet-stream` instead of JavaScript.
 
-This repo includes a GitHub Actions workflow at `.github/workflows/deploy-pages.yml` that builds the Vite app and deploys `dist` to GitHub Pages.
+This repo includes a GitHub Actions workflow at `.github/workflows/deploy-pages.yml` that runs lint, persistence-disabled tests, and the production build before deploying `dist` to GitHub Pages. Pull requests run the same quality checks through `.github/workflows/quality.yml`.
 
 1. In GitHub, open the repository settings.
 2. Go to **Pages**.
